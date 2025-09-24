@@ -35,6 +35,7 @@ except ImportError:
     VOSK_AVAILABLE = False
 
 from speech_service_api import SpeechService
+from .api.api.audio import Audio
 
 
 class SpeechProvider(str, Enum):
@@ -98,11 +99,15 @@ class SpeechIOService(SpeechService, EasyResource):
     disable_audioout: bool
     eleven_client: dict = {}
     main_loop: Optional[asyncio.AbstractEventLoop] = None
+    audio: str
+    audio_client: Optional[Audio] = None
 
     @classmethod
     def new(
         cls, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> Self:
+        print("deps")
+        print(dependencies)
         return super().new(config, dependencies)
 
     @classmethod
@@ -119,8 +124,13 @@ class SpeechIOService(SpeechService, EasyResource):
         deps = []
         attrs = struct_to_dict(config.attributes)
         stt_provider = str(attrs.get("stt_provider", ""))
+        audio = str(attrs.get("audio", ""))
         if stt_provider != "" and stt_provider != "google":
             deps.append(stt_provider)
+        # if audio != "":
+        #     deps.append(audio)
+        # print("validate config deps")
+        # print(deps)
         return deps
 
     async def say(self, text: str, blocking: bool, cache_only: bool = False) -> str:
@@ -265,17 +275,17 @@ class SpeechIOService(SpeechService, EasyResource):
         self.logger.info("using google stt")
         if rec_state.rec is not None:
             self.logger.info("rec_state.rec is not None")
-            
+
             # Use temporary file for speech_recognition
             import tempfile
             import os
-            
+
             try:
                 # Create temporary file with proper extension
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{format}") as temp_file:
                     temp_file.write(speech)
                     temp_file_path = temp_file.name
-                
+
                 try:
                     # Convert to WAV if needed
                     if format != "wav":
@@ -285,20 +295,20 @@ class SpeechIOService(SpeechService, EasyResource):
                         sound.export(wav_path, format="wav")
                         os.unlink(temp_file_path)  # Remove original file
                         temp_file_path = wav_path
-                    
+
                     # Use AudioData.from_file() to create AudioData directly from file
                     audio = sr.AudioData.from_file(temp_file_path)
                     self.logger.info(f"Created AudioData from file: {len(audio.frame_data)} bytes, {audio.sample_rate}Hz")
-                    
+
                     return await self.convert_audio_to_text(audio)
-                    
+
                 finally:
                     # Clean up temporary file
                     try:
                         os.unlink(temp_file_path)
                     except:
                         pass
-                        
+
             except Exception as e:
                 self.logger.error(f"Error processing audio: {e}")
                 return ""
@@ -320,7 +330,7 @@ class SpeechIOService(SpeechService, EasyResource):
     def vosk_vad_callback(self, text: str):
         """Callback for Vosk VAD when speech is detected"""
         self.logger.info(f"Vosk VAD detected speech: '{text}'")
-        
+
         if not self.main_loop or not self.main_loop.is_running():
             self.logger.error("Main event loop is not available for Vosk VAD task.")
             return
@@ -367,17 +377,17 @@ class SpeechIOService(SpeechService, EasyResource):
                 input=True,
                 frames_per_buffer=8000
             )
-            
+
             rec_state.vosk_stream = stream
-            
+
             # Track phrase timing for Vosk VAD
             phrase_start_time = None
             phrase_time_limit = self.listen_phrase_time_limit
-            
+
             while not rec_state.vosk_stop_event.is_set():
                 try:
                     data = stream.read(4000, exception_on_overflow=False)
-                    
+
                     # Check if we have speech activity
                     if rec_state.vosk_rec.AcceptWaveform(data):
                         result = json.loads(rec_state.vosk_rec.Result())
@@ -386,7 +396,7 @@ class SpeechIOService(SpeechService, EasyResource):
                             if phrase_start_time is None:
                                 phrase_start_time = time.time()
                                 self.logger.debug("Vosk VAD: Phrase started")
-                            
+
                             # Check phrase time limit
                             if phrase_time_limit and phrase_start_time:
                                 elapsed_time = time.time() - phrase_start_time
@@ -395,18 +405,18 @@ class SpeechIOService(SpeechService, EasyResource):
                                     # Reset for next phrase
                                     phrase_start_time = None
                                     continue
-                            
+
                             self.vosk_vad_callback(result['text'])
                         else:
                             # No speech detected, reset phrase timing
                             if phrase_start_time is not None:
                                 self.logger.debug("Vosk VAD: Phrase ended (no speech)")
                                 phrase_start_time = None
-                                
+
                 except Exception as e:
                     self.logger.error(f"Vosk VAD error: {e}")
                     break
-                    
+
         except Exception as e:
             self.logger.error(f"Vosk VAD thread error: {e}")
         finally:
@@ -420,7 +430,7 @@ class SpeechIOService(SpeechService, EasyResource):
         if not VOSK_AVAILABLE:
             self.logger.warning("Vosk not available, falling back to speech_recognition VAD")
             return False
-            
+
         try:
             # Try to load a small Vosk model for VAD
             # You can download models from https://alphacephei.com/vosk/models
@@ -432,17 +442,17 @@ class SpeechIOService(SpeechService, EasyResource):
                 else:
                     self.logger.warning("Failed to download Vosk model, falling back to speech_recognition VAD")
                     return False
-                
+
             rec_state.vosk_model = vosk.Model(model_path)
             rec_state.vosk_rec = vosk.KaldiRecognizer(rec_state.vosk_model, 16000)
             rec_state.vosk_stop_event = threading.Event()
-            
+
             rec_state.vosk_thread = threading.Thread(target=self.vosk_vad_thread, daemon=True)
             rec_state.vosk_thread.start()
-            
+
             self.logger.info("Started Vosk VAD for voice activity detection")
             return True
-            
+
         except Exception as e:
             self.logger.error(f"Failed to start Vosk VAD: {e}")
             return False
@@ -453,25 +463,25 @@ class SpeechIOService(SpeechService, EasyResource):
             import urllib.request
             import zipfile
             import shutil
-            
+
             model_name = "vosk-model-small-en-us-0.15"
             model_url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
             model_path = os.path.expanduser(f"~/{model_name}")
             zip_path = os.path.expanduser(f"~/{model_name}.zip")
-            
+
             self.logger.info(f"Downloading Vosk model from {model_url}")
-            
+
             # Download the model
             urllib.request.urlretrieve(model_url, zip_path)
-            
+
             # Extract the model
             self.logger.info("Extracting Vosk model...")
             with zipfile.ZipFile(zip_path, 'r') as zip_ref:
                 zip_ref.extractall(os.path.expanduser("~/"))
-            
+
             # Clean up zip file
             os.remove(zip_path)
-            
+
             # Verify the model was extracted correctly
             if os.path.exists(model_path):
                 self.logger.info(f"Vosk model downloaded successfully to {model_path}")
@@ -479,7 +489,7 @@ class SpeechIOService(SpeechService, EasyResource):
             else:
                 self.logger.error("Failed to extract Vosk model")
                 return False
-                
+
         except Exception as e:
             self.logger.error(f"Failed to download Vosk model: {e}")
             return False
@@ -578,6 +588,7 @@ class SpeechIOService(SpeechService, EasyResource):
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ):
+        print("RECONFIG")
         try:
             self.main_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -622,6 +633,7 @@ class SpeechIOService(SpeechService, EasyResource):
         self.trigger_active = False
         self.active_trigger_type = ""
         self.stt = None
+        self.audio= str(attrs.get("audio", ""))
 
         if (
             self.speech_provider == SpeechProvider.elevenlabs
@@ -634,6 +646,18 @@ class SpeechIOService(SpeechService, EasyResource):
         if self.stt_provider != "google":
             stt = dependencies[SpeechService.get_resource_name(self.stt_provider)]
             self.stt = cast(SpeechService, stt)
+
+        print("here")
+        print(self.audio)
+        print("HERE GETTING THE DEP")
+        # Try to find the audio component gracefully
+        self.audio_client = None
+
+
+        if self.audio_client is None:
+            print(f"Audio component '{self.audio}' not found in dependencies")
+            print(f"Available dependencies: {list(dependencies.keys())}")
+            print("Audio features will be disabled")
 
         if not self.disable_audioout:
             if not mixer.get_init():
@@ -653,7 +677,7 @@ class SpeechIOService(SpeechService, EasyResource):
             if rec_state.listen_closer is not None:
                 rec_state.listen_closer(True)
             self.stop_vosk_vad()
-            
+
             # Set up speech recognition
             rec_state.rec.dynamic_energy_threshold = True
 
@@ -670,7 +694,7 @@ class SpeechIOService(SpeechService, EasyResource):
             # set up background listening if desired
             if self.should_listen:
                 self.logger.info("Will listen in background")
-                
+
                 # Try Vosk VAD first if enabled
                 if self.use_vosk_vad and self.start_vosk_vad():
                     self.logger.info("Using Vosk VAD for voice activity detection")
