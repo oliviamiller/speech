@@ -1,0 +1,77 @@
+syntax = "proto3";
+
+option go_package = "./audio";
+import "google/api/annotations.proto";
+
+service AudioService {
+    rpc Play(PlayRequest) returns (PlayResponse) {
+      option (google.api.http) = {
+        post: "/olivia/api/v1/service/audio/{name}/play"
+    };
+    };
+
+
+      rpc Properties(PropertiesRequest) returns (PropertiesResponse) {
+         option (google.api.http) = {
+        post: "/olivia/api/v1/service/audio/{name}/properties"
+      };
+    };
+
+
+
+    rpc Record(RecordRequest) returns (stream AudioChunk) {
+        option (google.api.http) = {
+        post: "/olivia/api/v1/service/audio/{name}/record"
+    };
+    };
+  }
+
+  enum AudioFormat {
+    PCM16 = 0;
+    PCM32 = 1;
+    PCM32_FLOAT = 2;
+    MP3 = 3;
+    WAV = 4;
+  }
+
+  message AudioInfo {
+  AudioFormat format = 1;
+  int32 sample_rate = 2;
+  int32 channels = 3;
+}
+
+  message RecordRequest {
+    string name = 1;
+    int32 duration_seconds = 2;
+    AudioInfo info = 3;
+  }
+
+  message AudioChunk {
+    bytes audio_data = 1; // Raw PCM audio data
+    int64 timestamp = 2;  // Timestamp in microseconds
+    int32 sequence = 3;   // Sequence number
+    AudioInfo info = 4;
+  }
+
+
+  message PlayRequest {
+    string name = 1;
+    bytes audio_data = 2;
+    AudioFormat format = 3;
+    int32 sample_rate = 4; // required if format is pcm, optional otherwise
+    int32 channels = 5; // required if format is pcm, optional otherwise
+  }
+
+  message PlayResponse {
+    string name =1;
+  }
+
+  message PropertiesRequest {
+    string name = 1;
+  }
+
+  message PropertiesResponse {
+    repeated AudioFormat supportedFormats = 1;
+    int32 channels = 2;
+  }
+

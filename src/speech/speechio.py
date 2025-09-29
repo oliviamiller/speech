@@ -26,7 +26,7 @@ from elevenlabs import save as eleven_save
 from gtts import gTTS
 import openai
 import speech_recognition as sr
-from pydub import AudioSegment
+from pydub import AudioSegment, silence
 
 try:
     import vosk
@@ -35,7 +35,7 @@ except ImportError:
     VOSK_AVAILABLE = False
 
 from speech_service_api import SpeechService
-from .api.api.audio import Audio
+from ..grpc.api import Audio
 
 
 class SpeechProvider(str, Enum):
@@ -127,17 +127,15 @@ class SpeechIOService(SpeechService, EasyResource):
         audio = str(attrs.get("audio", ""))
         if stt_provider != "" and stt_provider != "google":
             deps.append(stt_provider)
-        # if audio != "":
-        #     deps.append(audio)
-        # print("validate config deps")
-        # print(deps)
+        if audio != "":
+            deps.append(audio)
         return deps
 
     async def say(self, text: str, blocking: bool, cache_only: bool = False) -> str:
         if str == "":
             raise ValueError("No text provided")
 
-        self.logger.debug("Generating audio...")
+        self.logger.info("Generating audio...")
         if not os.path.isdir(CACHEDIR):
             os.mkdir(CACHEDIR)
 
@@ -150,27 +148,45 @@ class SpeechIOService(SpeechService, EasyResource):
             + ".mp3",
         )
         try:
-            if not os.path.isfile(file):  # read from cache if it exists
-                if self.speech_provider == "elevenlabs":
-                    audio = self.eleven_client["client"].generate(
-                        text=text, voice=self.speech_voice
-                    )
-                    eleven_save(audio=audio, filename=file)
-                else:
-                    sp = gTTS(text=text, lang="en", slow=False)
-                    sp.save(file)
+            if self.speech_provider == "elevenlabs":
+                audio = self.eleven_client["client"].generate(
+                    text=text, voice=self.speech_voice
+                )
+                eleven_save(audio=audio, filename=file)
+            else:
+                sp = gTTS(text=text, lang="en", slow=False)
+                sp.save(file)
+                audio_bytes = BytesIO()
+                sp.write_to_fp(audio_bytes)
 
-            if not cache_only:
-                mixer.music.load(file)
-                self.logger.debug("Playing audio...")
-                mixer.music.play()  # Play it
 
-                if blocking:
-                    while mixer.music.get_busy():
-                        pygame.time.Clock().tick()
+            # if not cache_only:
+            #     mixer.music.load(file)
+            #     self.logger.debug("Playing audio...")
+            #     mixer.music.play()  # Play it
 
-                self.logger.debug("Played audio...")
+            #     if blocking:
+            #         while mixer.music.get_busy():
+            #             pygame.time.Clock().tick()
+
+            print("playing audio client")
+
+            # Check if audio client exists
+            if self.audio_client is None:
+                print("ERROR: audio_client is None")
+                return text
+
+            # Get the actual bytes from BytesIO
+            audio_data = audio_bytes.getvalue()
+            try:
+                await self.audio_client.play(audio_data, "mp3", 0, 0)
+                self.logger.info("Played audio...")
+            except Exception as e:
+                print(f"Error in audio_client.play(): {e}")
+                self.logger.error(f"Audio client play error: {e}")
+                raise
         except RuntimeError as err:
+            self.logger.info("error")
             self.logger.error(err)
             raise ValueError("say() speech failure")
 
@@ -259,10 +275,45 @@ class SpeechIOService(SpeechService, EasyResource):
         return to_return
 
     async def listen(self) -> str:
-        if rec_state.rec is not None and rec_state.mic is not None:
+        if self.audio_client is not None:
+            audioStream = self.audio_client.Record("pcm16", 16000, 1, 0)
+            buffer = bytearray()
+            silence_threshold = -16  # dB threshold for silence
+            min_silence_len = 2000   # 2 seconds of silence in ms
+
+            for chunk in audioStream:
+                buffer.extend(chunk.audio_data)
+            # Convert current buffer to AudioSegment for analysis
+                audio_segment = AudioSegment(
+                    data=bytes(buffer),
+                    sample_width=2,      # 2 bytes for 16-bit
+                    frame_rate=16000,    # 16kHz
+                    channels=1           # mono
+                )
+
+                # Check if we have enough audio to analyze (at least 3 seconds)
+                if len(audio_segment) >= 3000:  # 3 seconds in ms
+                      # Detect silence in the last portion
+                      recent_audio = audio_segment[-3000:]  # Last 3 seconds
+                      silence_ranges = silence.detect_silence(
+                          recent_audio,
+                          min_silence_len=min_silence_len,
+                          silence_thresh=silence_threshold
+                      )
+                    # If recent audio is mostly silence, stop recording
+                      if silence_ranges and len(silence_ranges[0]) >= min_silence_len:
+                          self.logger.info("Silence detected, stopping recording")
+                          break
+            if buffer:
+              audio_data = sr.AudioData(bytes(buffer), 16000, 2)
+              return await self.convert_audio_to_text(audio_data)
+
+        elif rec_state.rec is not None and rec_state.mic is not None:
             with rec_state.mic as source:
+                # this listens until silence is detected - need to implement this manually for audio
                 audio = rec_state.rec.listen(source)
             return await self.convert_audio_to_text(audio)
+
 
         self.logger.debug("Nothing to listen to")
         return ""
@@ -647,17 +698,15 @@ class SpeechIOService(SpeechService, EasyResource):
             stt = dependencies[SpeechService.get_resource_name(self.stt_provider)]
             self.stt = cast(SpeechService, stt)
 
-        print("here")
-        print(self.audio)
-        print("HERE GETTING THE DEP")
-        # Try to find the audio component gracefully
-        self.audio_client = None
 
+        if self.stt_provider != "google":
+            stt = dependencies[SpeechService.get_resource_name(self.stt_provider)]
+            self.stt = cast(SpeechService, stt)
 
-        if self.audio_client is None:
-            print(f"Audio component '{self.audio}' not found in dependencies")
-            print(f"Available dependencies: {list(dependencies.keys())}")
-            print("Audio features will be disabled")
+        if self.audio != "":
+            aud = dependencies[Audio.get_resource_name(self.audio)]
+            self.audio_client = cast(Audio, aud)
+
 
         if not self.disable_audioout:
             if not mixer.get_init():
