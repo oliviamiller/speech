@@ -19,6 +19,7 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model
 from viam.utils import struct_to_dict
 
+import numpy
 import pygame
 from pygame import mixer
 from elevenlabs.client import ElevenLabs
@@ -276,18 +277,32 @@ class SpeechIOService(SpeechService, EasyResource):
 
     async def listen(self) -> str:
         if self.audio_client is not None:
-            audioStream = self.audio_client.Record("pcm16", 16000, 1, 0)
+            audioStream = await self.audio_client.record("pcm16", 48000, 1, 0)
             buffer = bytearray()
-            silence_threshold = -16  # dB threshold for silence
-            min_silence_len = 2000   # 2 seconds of silence in ms
+            silence_threshold = -50  # dB threshold for silence (very lenient)
+            min_silence_len = 100   # 100ms of silence in ms
 
-            for chunk in audioStream:
+            async for chunk in audioStream:
                 buffer.extend(chunk.audio_data)
             # Convert current buffer to AudioSegment for analysis
+                # The buffer contains raw bytes from int16 samples - need to convert properly
+                import struct
+                if len(buffer) % 2 != 0:
+                    buffer = buffer[:-1]  # Ensure even number of bytes for int16
+
+                # Convert bytes to int16 values, then back to proper PCM format
+                int16_samples = struct.unpack('<' + 'h' * (len(buffer) // 2), bytes(buffer))
+                pcm_data = struct.pack('<' + 'h' * len(int16_samples), *int16_samples)
+
+                # Debug: Show actual int16 values from first few samples
+                print(f"Raw bytes (first 10): {list(bytes(buffer))[:10]}")
+                print(f"Int16 samples (first 5): {int16_samples[:5]}")
+                print(f"Min int16 sample: {min(int16_samples)}, Max int16 sample: {max(int16_samples)}")
+
                 audio_segment = AudioSegment(
-                    data=bytes(buffer),
+                    data=pcm_data,
                     sample_width=2,      # 2 bytes for 16-bit
-                    frame_rate=16000,    # 16kHz
+                    frame_rate=48000,    # 48kHz to match recording
                     channels=1           # mono
                 )
 
@@ -300,10 +315,24 @@ class SpeechIOService(SpeechService, EasyResource):
                           min_silence_len=min_silence_len,
                           silence_thresh=silence_threshold
                       )
+                      # Calculate min dBFS manually
+                      import numpy as np
+                      audio_array = np.array(recent_audio.get_array_of_samples())
+                      min_sample = np.min(np.abs(audio_array))
+                      print(f"Audio segment length: {len(recent_audio)}ms, Max dBFS: {recent_audio.max_dBFS:.1f}, average dBFS: {recent_audio.dBFS:.1f}")
+                      print(f"Silence threshold: {silence_threshold} dB, Min silence len: {min_silence_len} ms")
+                      print(f"Silence ranges found: {len(silence_ranges)}")
+                      if silence_ranges:
+                          print(f"Silence ranges: {silence_ranges[:3]}")  # Show first 3 ranges
                     # If recent audio is mostly silence, stop recording
-                      if silence_ranges and len(silence_ranges[0]) >= min_silence_len:
-                          self.logger.info("Silence detected, stopping recording")
-                          break
+                      if silence_ranges:
+                          print("here silence range")c
+                          # Check if there's a silience period that's long enough
+                          for silence_start, silence_end in silence_ranges:
+                              silence_duration = silence_end - silence_start
+                              if silence_duration >= min_silence_len:
+                                  self.logger.info("Silence detected, stopping recording")
+                                  break
             if buffer:
               audio_data = sr.AudioData(bytes(buffer), 16000, 2)
               return await self.convert_audio_to_text(audio_data)
