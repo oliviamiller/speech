@@ -35,7 +35,7 @@ except ImportError:
     VOSK_AVAILABLE = False
 
 from speech_service_api import SpeechService
-from ..grpc.api import Audio
+from py_audioin_api import Audio
 
 
 class SpeechProvider(str, Enum):
@@ -276,7 +276,7 @@ class SpeechIOService(SpeechService, EasyResource):
 
     async def listen(self) -> str:
         if self.audio_client is not None:
-            audioStream = self.audio_client.Record("pcm16", 16000, 1, 0)
+            audioStream = self.audio_client.get_audio(0, "pcm16", 0, 0)
             buffer = bytearray()
             silence_threshold = -16  # dB threshold for silence
             min_silence_len = 2000   # 2 seconds of silence in ms
