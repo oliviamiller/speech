@@ -28,6 +28,7 @@ from gtts import gTTS
 import openai
 import speech_recognition as sr
 from pydub import AudioSegment, silence
+import webrtcvad
 
 try:
     import vosk
@@ -62,6 +63,9 @@ class RecState:
     vosk_stream: Optional[object] = None
     vosk_thread: Optional[threading.Thread] = None
     vosk_stop_event: Optional[threading.Event] = None
+    # new AUDIO API fields
+    audio_listen_task: Optional[asyncio.Task] = None
+    audio_stop_event: Optional[asyncio.Event] = None
 
 
 CACHEDIR = "/tmp/cache"
@@ -216,6 +220,81 @@ class SpeechIOService(SpeechService, EasyResource):
 
     async def is_speaking(self) -> bool:
         return mixer.music.get_busy()
+    
+    # Background listening using audio client
+    def audio_listen_in_background(self, callback):
+        print("STARTING LISTENING IN BACKGROUND")
+        rec_state.audio_stop_event = asyncio.Event()
+        sample_rate = 48000
+        async def listen_loop():
+            print("IN LISTEN LOOP")
+            audioStream = await self.audio_client.get_audio(0, "pcm16", 0, 0)
+            buffer = bytearray()
+            speech_buffer = bytearray()
+
+            # Create WebRTC VAD once (aggressiveness 0-3, where 2 is balanced)
+            vad = webrtcvad.Vad(2)
+            print("WebRTC VAD created")
+
+            # WebRTC VAD requires specific frame sizes: 10, 20, or 30ms
+            # For 44100 Hz, 20ms = 882 samples = 1764 bytes (16-bit)
+            frame_duration = 20  # ms
+            frame_size = int(sample_rate * frame_duration / 1000) * 2  # bytes
+
+            is_speech = False
+            silence_frames = 0
+            max_silence_frames = 30  # 30 frames * 20ms = 600ms of silence to end
+
+            async for chunk in audioStream:
+                if rec_state.audio_stop_event.is_set():
+                    print("stop event is set")
+                    break
+                buffer.extend(chunk.audio_data)
+
+                # Process frames of fixed size
+                while len(buffer) >= frame_size:
+                    frame = bytes(buffer[:frame_size])
+                    buffer = buffer[frame_size:]
+
+                    try:
+                        # Detect speech in this frame
+                        speech_detected = vad.is_speech(frame, sample_rate)
+
+                        if speech_detected:
+                            print("Speech frame detected")
+                            is_speech = True
+                            silence_frames = 0
+                            speech_buffer.extend(frame)
+                        elif is_speech:
+                            # We were in speech, now silence
+                            silence_frames += 1
+                            speech_buffer.extend(frame)
+
+                            if silence_frames >= max_silence_frames:
+                                print("End of speech detected")
+                                # End of speech - run callback in executor to avoid blocking
+                                audio_data = sr.AudioData(bytes(speech_buffer), sample_rate, 2)
+                                asyncio.get_event_loop().run_in_executor(None, callback, rec_state.rec, audio_data)
+                                speech_buffer.clear()
+                                is_speech = False
+                                silence_frames = 0
+                    except Exception as e:
+                        print(f"VAD error: {e}")
+        print("STARTING TASK")
+        # Create task in the event loop
+        rec_state.audio_listen_task = asyncio.create_task(listen_loop())
+
+        # Return stop
+        def stop_listening(wait_for_stop=True):
+                if rec_state.audio_stop_event:
+                    rec_state.audio_stop_event.set()
+                if wait_for_stop and rec_state.audio_listen_task:
+                        rec_state.audio_listen_task.cancel()
+        return stop_listening
+
+
+
+
 
     async def completion(
         self, text: str, blocking: bool, cache_only: bool = False
@@ -268,41 +347,38 @@ class SpeechIOService(SpeechService, EasyResource):
             await self.say(completion, blocking)
         return completion
 
-    async def get_commands(self, number: int) -> list:
-        self.logger.debug("will get " + str(number) + " commands from command list")
-        to_return = self.command_list[0:number]
-        self.logger.debug("to return from command_list: " + str(to_return))
-        del self.command_list[0:number]
+    async def get_commands(self, number: int = -1) -> list:
+        # If number is -1 or not specified, return all commands
+        if number == -1:
+            to_return = self.command_list.copy()
+            self.logger.debug("will get all commands from command list: " + str(to_return))
+            self.command_list.clear()
+        else:
+            self.logger.debug("will get " + str(number) + " commands from command list")
+            to_return = self.command_list[0:number]
+            self.logger.debug("to return from command_list: " + str(to_return))
+            del self.command_list[0:number]
         return to_return
 
     async def listen(self) -> str:
+        print("LISTENING")
         if self.audio_client is not None:
-            audioStream = self.audio_client.get_audio(0, "pcm16", 0, 0)
+            audioStream = await self.audio_client.get_audio(0, "pcm16", 0, 0)
             buffer = bytearray()
-            silence_threshold = -50  # dB threshold for silence (very lenient)
-            min_silence_len = 100   # 100ms of silence in ms
 
+            # dB threshold for silence - a lower number = less silence will be detected. speech is -30 to -40 db. 
+            # for noisy environments, adjust closer to zero 
+            silence_threshold = -40
+            min_silence_len = 1000  
+            should_stop = False
             async for chunk in audioStream:
+                print("listen got chunk")
                 buffer.extend(chunk.audio_data)
-            # Convert current buffer to AudioSegment for analysis
-                # The buffer contains raw bytes from int16 samples - need to convert properly
-                import struct
-                if len(buffer) % 2 != 0:
-                    buffer = buffer[:-1]  # Ensure even number of bytes for int16
-
-                # Convert bytes to int16 values, then back to proper PCM format
-                int16_samples = struct.unpack('<' + 'h' * (len(buffer) // 2), bytes(buffer))
-                pcm_data = struct.pack('<' + 'h' * len(int16_samples), *int16_samples)
-
-                # Debug: Show actual int16 values from first few samples
-                print(f"Raw bytes (first 10): {list(bytes(buffer))[:10]}")
-                print(f"Int16 samples (first 5): {int16_samples[:5]}")
-                print(f"Min int16 sample: {min(int16_samples)}, Max int16 sample: {max(int16_samples)}")
 
                 audio_segment = AudioSegment(
-                    data=pcm_data,
+                    data=buffer,
                     sample_width=2,      # 2 bytes for 16-bit
-                    frame_rate=48000,    # 48kHz to match recording
+                    frame_rate=44100,    #  match recording
                     channels=1           # mono
                 )
 
@@ -326,15 +402,19 @@ class SpeechIOService(SpeechService, EasyResource):
                           print(f"Silence ranges: {silence_ranges[:3]}")  # Show first 3 ranges
                     # If recent audio is mostly silence, stop recording
                       if silence_ranges:
-                          print("here silence range")c
+                          print("here silence range")
                           # Check if there's a silience period that's long enough
                           for silence_start, silence_end in silence_ranges:
                               silence_duration = silence_end - silence_start
+                              print(silence_duration)
                               if silence_duration >= min_silence_len:
-                                  self.logger.info("Silence detected, stopping recording")
+                                  print("Silence detected, stopping recording")
+                                  should_stop = True
                                   break
+                if should_stop:
+                    break
             if buffer:
-              audio_data = sr.AudioData(bytes(buffer), 16000, 2)
+              audio_data = sr.AudioData(bytes(buffer), 44100, 2)
               return await self.convert_audio_to_text(audio_data)
 
         elif rec_state.rec is not None and rec_state.mic is not None:
@@ -602,6 +682,9 @@ class SpeechIOService(SpeechService, EasyResource):
         self.logger.info("speechio heard " + heard)
 
         if heard != "":
+            print(self.trigger_active)
+            print(self.active_trigger_type)
+            print(self.listen_trigger_command)
             if (
                 self.should_listen and re.search(".*" + self.listen_trigger_say, heard)
             ) or (self.trigger_active and self.active_trigger_type == "say"):
@@ -626,8 +709,10 @@ class SpeechIOService(SpeechService, EasyResource):
                 and re.search(".*" + self.listen_trigger_command, heard)
             ) or (self.trigger_active and self.active_trigger_type == "command"):
                 self.trigger_active = False
+                print("here trigger command")
                 command = re.sub(".*" + self.listen_trigger_command + r"\s+", "", heard)
                 self.command_list.insert(0, command)
+                print("adding to command list")
                 self.logger.debug("added to command_list: '" + command + "'")
                 del self.command_list[self.listen_command_buffer_length :]
             if not self.should_listen:
@@ -637,6 +722,7 @@ class SpeechIOService(SpeechService, EasyResource):
                     rec_state.listen_closer()
 
     async def convert_audio_to_text(self, audio: sr.AudioData) -> str:
+        print("CONVERTING AUDIO TO TEXT")
         if self.stt is not None:
             self.logger.info("getting wav data")
             audio_data = audio.get_wav_data()
@@ -736,6 +822,7 @@ class SpeechIOService(SpeechService, EasyResource):
             aud = dependencies[Audio.get_resource_name(self.audio)]
             self.audio_client = cast(Audio, aud)
 
+        print(self.audio_client)
 
         if not self.disable_audioout:
             if not mixer.get_init():
@@ -773,14 +860,21 @@ class SpeechIOService(SpeechService, EasyResource):
             if self.should_listen:
                 self.logger.info("Will listen in background")
 
-                # Try Vosk VAD first if enabled
-                if self.use_vosk_vad and self.start_vosk_vad():
-                    self.logger.info("Using Vosk VAD for voice activity detection")
-                else:
-                    # Fall back to speech_recognition VAD
-                    self.logger.info("Using speech_recognition VAD")
-                    rec_state.listen_closer = rec_state.rec.listen_in_background(
-                        source=rec_state.mic,
-                        phrase_time_limit=self.listen_phrase_time_limit,
-                        callback=self.listen_callback,
-                    )
+                if self.audio_client is not None:
+                    print("HERE AUDIO CLIENT")
+                    # Call directly - it's now a regular function that creates a task
+                    rec_state.listen_closer = self.audio_listen_in_background(self.listen_callback)
+                    print("here got listen closer")
+
+                # # Try Vosk VAD first if enabled
+                # if self.use_vosk_vad and self.start_vosk_vad():
+                #     self.logger.info("Using Vosk VAD for voice activity detection")
+                # else:
+                #     # Fall back to speech_recognition VAD
+                #     self.logger.info("Using speech_recognition VAD")
+                #     rec_state.listen_closer = rec_state.rec.listen_in_background(
+                #         source=rec_state.mic,
+                #         phrase_time_limit=self.listen_phrase_time_limit,
+                #         callback=self.listen_callback,
+                #     )
+                
