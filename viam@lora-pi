@@ -6,7 +6,6 @@ import re
 import asyncio
 import hashlib
 import wave
-import time
 import threading
 import pyaudio
 import json
@@ -30,7 +29,6 @@ import openai
 import speech_recognition as sr
 from pydub import AudioSegment, silence
 import webrtcvad
-import tempfile
 
 try:
     import vosk
@@ -68,8 +66,6 @@ class RecState:
     # new AUDIO API fields
     audio_listen_task: Optional[asyncio.Task] = None
     audio_stop_event: Optional[asyncio.Event] = None
-    # STT throttling
-    stt_in_progress: bool = False
 
 
 CACHEDIR = "/tmp/cache"
@@ -187,49 +183,13 @@ class SpeechIOService(SpeechService, EasyResource):
 
             # Get the actual bytes from BytesIO
             audio_data = audio_bytes.getvalue()
-
-
-            # Resample MP3 to 48kHz for USB speaker compatibility
             try:
-                # Load MP3 audio data
-                audio_segment = AudioSegment.from_file(BytesIO(audio_data), format="mp3")
-
-                # Get original properties
-                original_sample_rate = audio_segment.frame_rate
-                original_channels = audio_segment.channels
-
-                print(f"Original MP3: {original_sample_rate}Hz, {original_channels} channels")
-
-                # Resample to 48kHz (required by USB speaker)
-                target_sample_rate = 48000
-                if original_sample_rate != target_sample_rate:
-                    print(f"Resampling from {original_sample_rate}Hz to {target_sample_rate}Hz")
-                    audio_segment = audio_segment.set_frame_rate(target_sample_rate)
-
-                # Export resampled MP3
-                resampled_buffer = BytesIO()
-                audio_segment.export(resampled_buffer, format="mp3")
-                resampled_audio_data = resampled_buffer.getvalue()
-
-                # Use resampled audio with correct parameters
-                await self.audio_client.play(
-                    resampled_audio_data,
-                    "mp3",
-                    None,
-                    None
-                )
-                self.logger.info("Played resampled audio...")
-
+                await self.audio_client.play(audio_data, "mp3", 0, 0)
+                self.logger.info("Played audio...")
             except Exception as e:
                 print(f"Error in audio_client.play(): {e}")
                 self.logger.error(f"Audio client play error: {e}")
-                # Fallback to original audio with best guess parameters
-                try:
-                    await self.audio_client.play(audio_data, "mp3", 44100, 2)
-                    print("here played audio")
-                except:
-                    print("here except")
-                    raise
+                raise
         except RuntimeError as err:
             self.logger.info("error")
             self.logger.error(err)
@@ -296,12 +256,12 @@ class SpeechIOService(SpeechService, EasyResource):
                     frame = bytes(buffer[:frame_size])
                     buffer = buffer[frame_size:]
 
-
                     try:
                         # Detect speech in this frame
                         speech_detected = vad.is_speech(frame, sample_rate)
 
                         if speech_detected:
+                            print("speech detected")
                             is_speech = True
                             silence_frames = 0
                             speech_buffer.extend(frame)
@@ -311,19 +271,13 @@ class SpeechIOService(SpeechService, EasyResource):
                             speech_buffer.extend(frame)
 
                             if silence_frames >= max_silence_frames:
-                                print("End of speech detected, running audio to text")
-                                # Check if STT is already running
-                                if not rec_state.stt_in_progress:
-                                    rec_state.stt_in_progress = True
-                                    # End of speech - run callback in executor to avoid blocking
-                                    audio_data = sr.AudioData(bytes(speech_buffer), sample_rate, 2)
-                                    asyncio.get_event_loop().run_in_executor(None, callback, rec_state.rec, audio_data)
-                                else:
-                                    print("STT already in progress, skipping this audio")
+                                print("End of speech detected")
+                                # End of speech - run callback in executor to avoid blocking
+                                audio_data = sr.AudioData(bytes(speech_buffer), sample_rate, 2)
+                                asyncio.get_event_loop().run_in_executor(None, callback, rec_state.rec, audio_data)
                                 speech_buffer.clear()
                                 is_speech = False
                                 silence_frames = 0
-                                break
                     except Exception as e:
                         print(f"VAD error: {e}")
         print("STARTING TASK")
@@ -769,38 +723,33 @@ class SpeechIOService(SpeechService, EasyResource):
 
     async def convert_audio_to_text(self, audio: sr.AudioData) -> str:
         print("CONVERTING AUDIO TO TEXT")
+        if self.stt is not None:
+            self.logger.info("getting wav data")
+            audio_data = audio.get_wav_data()
+            self.logger.info("using stt provider")
+            return await self.stt.to_text(audio_data, format="wav")
+
+        heard = ""
+
         try:
-            if self.stt is not None:
-                self.logger.info("getting wav data")
-                audio_data = audio.get_wav_data()
-                self.logger.info("using stt provider")
-                return await self.stt.to_text(audio_data, format="wav")
-
-            heard = ""
-
-            try:
-                self.logger.info("will convert audio to text")
-                # for testing purposes, we're just using the default API key
-                # to use another API key, use `r.recognize_google(audio, key="GOOGLE_SPEECH_RECOGNITION_API_KEY")`
-                # instead of `r.recognize_google(audio)`
-                transcript = rec_state.rec.recognize_google(audio, show_all=True)
-                self.logger.info("transcript: " + str(transcript))
-                if type(transcript) is dict and transcript.get("alternative"):
-                    heard = transcript["alternative"][0]["transcript"]
-                    self.logger.info("heard: " + heard)
-            except sr.UnknownValueError:
-                self.logger.warning("Google Speech Recognition could not understand audio")
-            except sr.RequestError as e:
-                self.logger.warning(
-                    "Could not request results from Google Speech Recognition service; {0}".format(
-                        e
-                    )
+            self.logger.info("will convert audio to text")
+            # for testing purposes, we're just using the default API key
+            # to use another API key, use `r.recognize_google(audio, key="GOOGLE_SPEECH_RECOGNITION_API_KEY")`
+            # instead of `r.recognize_google(audio)`
+            transcript = rec_state.rec.recognize_google(audio, show_all=True)
+            self.logger.info("transcript: " + str(transcript))
+            if type(transcript) is dict and transcript.get("alternative"):
+                heard = transcript["alternative"][0]["transcript"]
+                self.logger.info("heard: " + heard)
+        except sr.UnknownValueError:
+            self.logger.warning("Google Speech Recognition could not understand audio")
+        except sr.RequestError as e:
+            self.logger.warning(
+                "Could not request results from Google Speech Recognition service; {0}".format(
+                    e
                 )
-            return heard
-        finally:
-            # Always reset the STT flag when done
-            rec_state.stt_in_progress = False
-            print("STT processing complete, ready for next request")
+            )
+        return heard
 
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
