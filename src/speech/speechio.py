@@ -20,7 +20,7 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model
 from viam.utils import struct_to_dict
 
-import numpy
+import numpy as np
 import pygame
 from pygame import mixer
 from elevenlabs.client import ElevenLabs
@@ -115,8 +115,6 @@ class SpeechIOService(SpeechService, EasyResource):
     def new(
         cls, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> Self:
-        print("deps")
-        print(dependencies)
         return super().new(config, dependencies)
 
     @classmethod
@@ -178,7 +176,6 @@ class SpeechIOService(SpeechService, EasyResource):
             #         while mixer.music.get_busy():
             #             pygame.time.Clock().tick()
 
-            print("playing audio client")
 
             # Check if audio client exists
             if self.audio_client is None:
@@ -188,48 +185,15 @@ class SpeechIOService(SpeechService, EasyResource):
             # Get the actual bytes from BytesIO
             audio_data = audio_bytes.getvalue()
 
-
-            # Resample MP3 to 48kHz for USB speaker compatibility
-            try:
-                # Load MP3 audio data
-                audio_segment = AudioSegment.from_file(BytesIO(audio_data), format="mp3")
-
-                # Get original properties
-                original_sample_rate = audio_segment.frame_rate
-                original_channels = audio_segment.channels
-
-                print(f"Original MP3: {original_sample_rate}Hz, {original_channels} channels")
-
-                # Resample to 48kHz (required by USB speaker)
-                target_sample_rate = 48000
-                if original_sample_rate != target_sample_rate:
-                    print(f"Resampling from {original_sample_rate}Hz to {target_sample_rate}Hz")
-                    audio_segment = audio_segment.set_frame_rate(target_sample_rate)
-
-                # Export resampled MP3
-                resampled_buffer = BytesIO()
-                audio_segment.export(resampled_buffer, format="mp3")
-                resampled_audio_data = resampled_buffer.getvalue()
-
-                # Use resampled audio with correct parameters
-                await self.audio_client.play(
-                    resampled_audio_data,
-                    "mp3",
-                    None,
-                    None
-                )
-                self.logger.info("Played resampled audio...")
+            await self.audio_client.play(
+                audio_data,
+                "mp3",
+                24000,
+                2
+            )
 
             except Exception as e:
-                print(f"Error in audio_client.play(): {e}")
                 self.logger.error(f"Audio client play error: {e}")
-                # Fallback to original audio with best guess parameters
-                try:
-                    await self.audio_client.play(audio_data, "mp3", 44100, 2)
-                    print("here played audio")
-                except:
-                    print("here except")
-                    raise
         except RuntimeError as err:
             self.logger.info("error")
             self.logger.error(err)
@@ -263,21 +227,18 @@ class SpeechIOService(SpeechService, EasyResource):
 
     # Background listening using audio client
     def audio_listen_in_background(self, callback):
-        print("STARTING LISTENING IN BACKGROUND")
         rec_state.audio_stop_event = asyncio.Event()
         sample_rate = 48000
+        self.logger.info("speech is listening in background")
         async def listen_loop():
-            print("IN LISTEN LOOP")
             audioStream = await self.audio_client.get_audio(0, "pcm16", 0, 0)
             buffer = bytearray()
             speech_buffer = bytearray()
 
             # Create WebRTC VAD once (aggressiveness 0-3, where 2 is balanced)
             vad = webrtcvad.Vad(3)
-            print("WebRTC VAD created")
 
             # WebRTC VAD requires specific frame sizes: 10, 20, or 30ms
-            # For 44100 Hz, 20ms = 882 samples = 1764 bytes (16-bit)
             frame_duration = 20  # ms
             frame_size = int(sample_rate * frame_duration / 1000) * 2  # bytes
 
@@ -287,7 +248,6 @@ class SpeechIOService(SpeechService, EasyResource):
 
             async for chunk in audioStream:
                 if rec_state.audio_stop_event.is_set():
-                    print("stop event is set")
                     break
                 buffer.extend(chunk.audio_data)
 
@@ -326,7 +286,7 @@ class SpeechIOService(SpeechService, EasyResource):
                                 break
                     except Exception as e:
                         print(f"VAD error: {e}")
-        print("STARTING TASK")
+
         # Create task in the event loop
         rec_state.audio_listen_task = asyncio.create_task(listen_loop())
 
@@ -337,9 +297,6 @@ class SpeechIOService(SpeechService, EasyResource):
                 if wait_for_stop and rec_state.audio_listen_task:
                         rec_state.audio_listen_task.cancel()
         return stop_listening
-
-
-
 
 
     async def completion(
@@ -407,7 +364,6 @@ class SpeechIOService(SpeechService, EasyResource):
         return to_return
 
     async def listen(self) -> str:
-        print("LISTENING")
         if self.audio_client is not None:
             audioStream = await self.audio_client.get_audio(0, "pcm16", 0, 0)
             buffer = bytearray()
@@ -417,8 +373,8 @@ class SpeechIOService(SpeechService, EasyResource):
             silence_threshold = -40
             min_silence_len = 1000
             should_stop = False
+
             async for chunk in audioStream:
-                print("listen got chunk")
                 buffer.extend(chunk.audio_data)
 
                 audio_segment = AudioSegment(
@@ -438,21 +394,16 @@ class SpeechIOService(SpeechService, EasyResource):
                           silence_thresh=silence_threshold
                       )
                       # Calculate min dBFS manually
-                      import numpy as np
                       audio_array = np.array(recent_audio.get_array_of_samples())
                       min_sample = np.min(np.abs(audio_array))
                       print(f"Audio segment length: {len(recent_audio)}ms, Max dBFS: {recent_audio.max_dBFS:.1f}, average dBFS: {recent_audio.dBFS:.1f}")
                       print(f"Silence threshold: {silence_threshold} dB, Min silence len: {min_silence_len} ms")
                       print(f"Silence ranges found: {len(silence_ranges)}")
-                      if silence_ranges:
-                          print(f"Silence ranges: {silence_ranges[:3]}")  # Show first 3 ranges
                     # If recent audio is mostly silence, stop recording
                       if silence_ranges:
-                          print("here silence range")
                           # Check if there's a silience period that's long enough
                           for silence_start, silence_end in silence_ranges:
                               silence_duration = silence_end - silence_start
-                              print(silence_duration)
                               if silence_duration >= min_silence_len:
                                   print("Silence detected, stopping recording")
                                   should_stop = True
@@ -728,9 +679,6 @@ class SpeechIOService(SpeechService, EasyResource):
         self.logger.info("speechio heard " + heard)
 
         if heard != "":
-            print(self.trigger_active)
-            print(self.active_trigger_type)
-            print(self.listen_trigger_command)
             if (
                 self.should_listen and re.search(".*" + self.listen_trigger_say, heard)
             ) or (self.trigger_active and self.active_trigger_type == "say"):
@@ -755,10 +703,8 @@ class SpeechIOService(SpeechService, EasyResource):
                 and re.search(".*" + self.listen_trigger_command, heard)
             ) or (self.trigger_active and self.active_trigger_type == "command"):
                 self.trigger_active = False
-                print("here trigger command")
                 command = re.sub(".*" + self.listen_trigger_command + r"\s+", "", heard)
                 self.command_list.insert(0, command)
-                print("adding to command list")
                 self.logger.debug("added to command_list: '" + command + "'")
                 del self.command_list[self.listen_command_buffer_length :]
             if not self.should_listen:
@@ -768,7 +714,6 @@ class SpeechIOService(SpeechService, EasyResource):
                     rec_state.listen_closer()
 
     async def convert_audio_to_text(self, audio: sr.AudioData) -> str:
-        print("CONVERTING AUDIO TO TEXT")
         try:
             if self.stt is not None:
                 self.logger.info("getting wav data")
@@ -805,7 +750,6 @@ class SpeechIOService(SpeechService, EasyResource):
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ):
-        print("RECONFIG")
         try:
             self.main_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -873,8 +817,6 @@ class SpeechIOService(SpeechService, EasyResource):
             aud = dependencies[Audio.get_resource_name(self.audio)]
             self.audio_client = cast(Audio, aud)
 
-        print(self.audio_client)
-
         if not self.disable_audioout:
             if not mixer.get_init():
                 try:
@@ -920,8 +862,6 @@ class SpeechIOService(SpeechService, EasyResource):
                 #     )
                    # set up background listening if desired
         if self.should_listen:
-                self.logger.info("Will listen in background")
-
                 if self.audio_client is not None:
                     rec_state.listen_closer = self.audio_listen_in_background(self.listen_callback)
 
