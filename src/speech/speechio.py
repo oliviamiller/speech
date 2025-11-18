@@ -1,5 +1,5 @@
 from io import BytesIO
-from typing import ClassVar, Mapping, Optional, Protocol, Sequence, cast
+from typing import Callable, ClassVar, Mapping, Optional, Protocol, Sequence, cast
 from enum import Enum
 import os
 import re
@@ -14,8 +14,10 @@ import time
 from typing_extensions import Self
 
 from viam.proto.app.robot import ComponentConfig
-from viam.proto.common import ResourceName
+from viam.proto.common import ResourceName, AudioInfo
 from viam.resource.base import ResourceBase
+from viam.components.audio_in import AudioIn
+from viam.components.audio_out import AudioOut
 from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model
 from viam.utils import struct_to_dict
@@ -39,7 +41,6 @@ except ImportError:
     VOSK_AVAILABLE = False
 
 from speech_service_api import SpeechService
-from py_audioin_api import Audio
 
 
 class SpeechProvider(str, Enum):
@@ -65,6 +66,7 @@ class RecState:
     vosk_stream: Optional[object] = None
     vosk_thread: Optional[threading.Thread] = None
     vosk_stop_event: Optional[threading.Event] = None
+    vosk_closer: Optional[Callable] = None  # For microphone_client version
     # new AUDIO API fields
     audio_listen_task: Optional[asyncio.Task] = None
     audio_stop_event: Optional[asyncio.Event] = None
@@ -108,15 +110,15 @@ class SpeechIOService(SpeechService, EasyResource):
     disable_audioout: bool
     eleven_client: dict = {}
     main_loop: Optional[asyncio.AbstractEventLoop] = None
-    audio: str
-    audio_client: Optional[Audio] = None
+    microphone: str
+    microphone_client: Optional[AudioIn] = None
+    speaker: str
+    speaker_client: Optional[AudioOut] = None
 
     @classmethod
     def new(
         cls, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ) -> Self:
-        print("deps")
-        print(dependencies)
         return super().new(config, dependencies)
 
     @classmethod
@@ -133,11 +135,14 @@ class SpeechIOService(SpeechService, EasyResource):
         deps = []
         attrs = struct_to_dict(config.attributes)
         stt_provider = str(attrs.get("stt_provider", ""))
-        audio = str(attrs.get("audio", ""))
         if stt_provider != "" and stt_provider != "google":
             deps.append(stt_provider)
-        if audio != "":
-            deps.append(audio)
+        microphone = str(attrs.get("microphone_name", ""))
+        if microphone != "":
+            deps.append(microphone)
+        speaker = str(attrs.get("speaker_name", ""))
+        if speaker != "":
+            deps.append(speaker)
         return deps
 
     async def say(self, text: str, blocking: bool, cache_only: bool = False) -> str:
@@ -168,72 +173,60 @@ class SpeechIOService(SpeechService, EasyResource):
                 audio_bytes = BytesIO()
                 sp.write_to_fp(audio_bytes)
 
+            if self.speaker_client is not None:
+                # Get the actual bytes from BytesIO
+                audio_data = audio_bytes.getvalue()
 
-            # if not cache_only:
-            #     mixer.music.load(file)
-            #     self.logger.debug("Playing audio...")
-            #     mixer.music.play()  # Play it
-
-            #     if blocking:
-            #         while mixer.music.get_busy():
-            #             pygame.time.Clock().tick()
-
-            print("playing audio client")
-
-            # Check if audio client exists
-            if self.audio_client is None:
-                print("ERROR: audio_client is None")
-                return text
-
-            # Get the actual bytes from BytesIO
-            audio_data = audio_bytes.getvalue()
-
-
-            # Resample MP3 to 48kHz for USB speaker compatibility
-            try:
-                # Load MP3 audio data
-                audio_segment = AudioSegment.from_file(BytesIO(audio_data), format="mp3")
-
-                # Get original properties
-                original_sample_rate = audio_segment.frame_rate
-                original_channels = audio_segment.channels
-
-                print(f"Original MP3: {original_sample_rate}Hz, {original_channels} channels")
-
-                # Resample to 48kHz (required by USB speaker)
-                target_sample_rate = 48000
-                if original_sample_rate != target_sample_rate:
-                    print(f"Resampling from {original_sample_rate}Hz to {target_sample_rate}Hz")
-                    audio_segment = audio_segment.set_frame_rate(target_sample_rate)
-
-                # Export resampled MP3
-                resampled_buffer = BytesIO()
-                audio_segment.export(resampled_buffer, format="mp3")
-                resampled_audio_data = resampled_buffer.getvalue()
-
-                # Use resampled audio with correct parameters
-                await self.audio_client.play(
-                    resampled_audio_data,
-                    "mp3",
-                    None,
-                    None
-                )
-                self.logger.info("Played resampled audio...")
-
-            except Exception as e:
-                print(f"Error in audio_client.play(): {e}")
-                self.logger.error(f"Audio client play error: {e}")
-                # Fallback to original audio with best guess parameters
+                # Resample MP3 to 48kHz for USB speaker compatibility
                 try:
-                    await self.audio_client.play(audio_data, "mp3", 44100, 2)
-                    print("here played audio")
-                except:
-                    print("here except")
-                    raise
+                    # Load MP3 audio data to get duration and audio properties
+                    audio_segment = AudioSegment.from_file(BytesIO(audio_data), format="mp3")
+                    duration_seconds = len(audio_segment) / 1000.0  # Convert ms to seconds
+
+                    # Create AudioInfo for MP3 format with actual properties
+                    # This tells the audio system the format and properties of the audio
+                    audio_info = AudioInfo(
+                        codec="mp3",
+                        sample_rate_hz=audio_segment.frame_rate,
+                        num_channels=audio_segment.channels
+                    )
+
+                    self.is_playing_audio = True
+                    await self.speaker_client.play(
+                        audio_data,
+                        audio_info
+                    )
+                    if blocking:
+                        await asyncio.sleep(duration_seconds)
+                        self.is_playing_audio = False
+                    else:
+                        # If not blocking, schedule state reset after duration
+                        asyncio.create_task(self._reset_playing_state(duration_seconds))
+                    self.logger.info("Played audio...")
+
+                except Exception as e:
+                    print(f"Error in speaker play(): {e}")
+                    self.logger.error(f"speaker client play error: {e}")
+                    # # Fallback to original audio with best guess parameters
+                    # try:
+                    #     await self.microphone_client.play(audio_data, "mp3", 44100, 2)
+                    #     print("here played audio")
+            else:
+                  # Fallback to pygame mixer if no speaker_client
+                if not cache_only:
+                        mixer.music.load(file)
+                        self.logger.debug("Playing audio...")
+                        mixer.music.play()  # Play it
+
+                        if blocking:
+                            while mixer.music.get_busy():
+                                pygame.time.Clock().tick()
+
         except RuntimeError as err:
-            self.logger.info("error")
-            self.logger.error(err)
-            raise ValueError("say() speech failure")
+                self.logger.info("error")
+                self.logger.error(err)
+                raise ValueError("say() speech failure")
+
 
         return text
 
@@ -247,7 +240,11 @@ class SpeechIOService(SpeechService, EasyResource):
                 # close and re-open listener so any in-progress speech is not captured
                 if rec_state.listen_closer is not None:
                     rec_state.listen_closer(True)
-            if rec_state.rec is not None and rec_state.mic is not None:
+
+            # Use microphone_client if available, otherwise use pygame microphone
+            if self.microphone_client is not None:
+                rec_state.listen_closer = self.audio_listen_in_background(self.listen_callback)
+            elif rec_state.rec is not None and rec_state.mic is not None:
                 rec_state.listen_closer = rec_state.rec.listen_in_background(
                     source=rec_state.mic,
                     phrase_time_limit=self.listen_phrase_time_limit,
@@ -259,16 +256,32 @@ class SpeechIOService(SpeechService, EasyResource):
         return "OK"
 
     async def is_speaking(self) -> bool:
-        return mixer.music.get_busy()
+        if self.speaker_client is not None:
+            return self.is_playing_audio
+        else:
+            return mixer.music.get_busy()
+
+    async def _reset_playing_state(self, delay: float):
+        """Helper to reset playing state after delay"""
+        await asyncio.sleep(delay)
+        self.is_playing_audio = False
 
     # Background listening using audio client
     def audio_listen_in_background(self, callback):
         print("STARTING LISTENING IN BACKGROUND")
         rec_state.audio_stop_event = asyncio.Event()
-        sample_rate = 48000
         async def listen_loop():
             print("IN LISTEN LOOP")
-            audioStream = await self.audio_client.get_audio(0, "pcm16", 0, 0)
+            try:
+                print(f"Calling get_audio with microphone_client: {self.microphone_client}")
+                audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
+                print(f"Got audio_stream: {audio_stream}, type: {type(audio_stream)}")
+            except Exception as e:
+                print(f"ERROR getting audio stream: {e}")
+                import traceback
+                traceback.print_exc()
+                return
+
             buffer = bytearray()
             speech_buffer = bytearray()
 
@@ -279,54 +292,63 @@ class SpeechIOService(SpeechService, EasyResource):
             # WebRTC VAD requires specific frame sizes: 10, 20, or 30ms
             # For 44100 Hz, 20ms = 882 samples = 1764 bytes (16-bit)
             frame_duration = 20  # ms
-            frame_size = int(sample_rate * frame_duration / 1000) * 2  # bytes
 
             is_speech = False
             silence_frames = 0
             max_silence_frames = 30  # 30 frames * 20ms = 600ms of silence to end
 
-            async for chunk in audioStream:
-                if rec_state.audio_stop_event.is_set():
-                    print("stop event is set")
-                    break
-                buffer.extend(chunk.audio_data)
+            try:
+                async for resp in audio_stream:
+                    if rec_state.audio_stop_event.is_set():
+                        print("stop event set")
+                        break
+                    sample_rate = resp.audio.audio_info.sample_rate_hz
 
-                # Process frames of fixed size
-                while len(buffer) >= frame_size:
-                    frame = bytes(buffer[:frame_size])
-                    buffer = buffer[frame_size:]
+                    # WebRTC VAD only supports specific sample rates
+                    if sample_rate not in [8000, 16000, 32000, 48000]:
+                        print(f"ERROR: Invalid sample rate {sample_rate} Hz for WebRTC VAD.")
+                        print(f"Supported rates: 8000, 16000, 32000, 48000 Hz")
+                        continue
 
+                    buffer.extend(resp.audio.audio_data)
+                    frame_size = int(sample_rate * frame_duration / 1000) * 2  # bytes
 
-                    try:
-                        # Detect speech in this frame
-                        speech_detected = vad.is_speech(frame, sample_rate)
+                    # Process frames of fixed size
+                    while len(buffer) >= frame_size:
+                        frame = bytes(buffer[:frame_size])
+                        buffer = buffer[frame_size:]
 
-                        if speech_detected:
-                            is_speech = True
-                            silence_frames = 0
-                            speech_buffer.extend(frame)
-                        elif is_speech:
-                            # We were in speech, now silence
-                            silence_frames += 1
-                            speech_buffer.extend(frame)
+                        try:
+                            # Detect speech in this frame
+                            speech_detected = vad.is_speech(frame, sample_rate)
 
-                            if silence_frames >= max_silence_frames:
-                                print("End of speech detected, running audio to text")
-                                # Check if STT is already running
-                                if not rec_state.stt_in_progress:
-                                    rec_state.stt_in_progress = True
-                                    # End of speech - run callback in executor to avoid blocking
-                                    audio_data = sr.AudioData(bytes(speech_buffer), sample_rate, 2)
-                                    asyncio.get_event_loop().run_in_executor(None, callback, rec_state.rec, audio_data)
-                                else:
-                                    print("STT already in progress, skipping this audio")
-                                speech_buffer.clear()
-                                is_speech = False
+                            if speech_detected:
+                                is_speech = True
                                 silence_frames = 0
-                                break
-                    except Exception as e:
-                        print(f"VAD error: {e}")
-        print("STARTING TASK")
+                                speech_buffer.extend(frame)
+                            elif is_speech:
+                                # We were in speech, now silence
+                                silence_frames += 1
+                                speech_buffer.extend(frame)
+
+                                if silence_frames >= max_silence_frames:
+                                    print("End of speech detected, running audio to text")
+                                    # Check if STT is already running
+                                    if not rec_state.stt_in_progress:
+                                        rec_state.stt_in_progress = True
+                                        # End of speech - run callback in executor to avoid blocking
+                                        audio_data = sr.AudioData(bytes(speech_buffer), sample_rate, 2)
+                                        asyncio.get_event_loop().run_in_executor(None, callback, rec_state.rec, audio_data)
+                                    else:
+                                        print("STT already in progress, skipping this audio")
+                                    speech_buffer.clear()
+                                    is_speech = False
+                                    silence_frames = 0
+                                    break
+                        except Exception as e:
+                            print(f"VAD error: {e}")
+            except Exception as e:
+                print(f"FATAL ERROR in listen_loop: {e}")
         # Create task in the event loop
         rec_state.audio_listen_task = asyncio.create_task(listen_loop())
 
@@ -408,8 +430,8 @@ class SpeechIOService(SpeechService, EasyResource):
 
     async def listen(self) -> str:
         print("LISTENING")
-        if self.audio_client is not None:
-            audioStream = await self.audio_client.get_audio(0, "pcm16", 0, 0)
+        if self.microphone_client is not None:
+            audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
             buffer = bytearray()
 
             # dB threshold for silence - a lower number = less silence will be detected. speech is -30 to -40 db.
@@ -417,15 +439,17 @@ class SpeechIOService(SpeechService, EasyResource):
             silence_threshold = -40
             min_silence_len = 1000
             should_stop = False
-            async for chunk in audioStream:
-                print("listen got chunk")
-                buffer.extend(chunk.audio_data)
+            async for resp in audio_stream:
+                buffer.extend(resp.audio.audio_data)
+                sample_rate = resp.audio.audio_info.sample_rate_hz
+                num_channels = resp.audio.audio_info.num_channels
+                sample_width = 2    # 2 bytes for 16-bit
 
                 audio_segment = AudioSegment(
                     data=buffer,
-                    sample_width=2,      # 2 bytes for 16-bit
-                    frame_rate=44100,    #  match recording
-                    channels=1           # mono
+                    sample_width=sample_width,
+                    frame_rate=sample_rate,
+                    channels=num_channels
                 )
 
                 # Check if we have enough audio to analyze (at least 3 seconds)
@@ -438,12 +462,11 @@ class SpeechIOService(SpeechService, EasyResource):
                           silence_thresh=silence_threshold
                       )
                       # Calculate min dBFS manually
-                      import numpy as np
-                      audio_array = np.array(recent_audio.get_array_of_samples())
-                      min_sample = np.min(np.abs(audio_array))
-                      print(f"Audio segment length: {len(recent_audio)}ms, Max dBFS: {recent_audio.max_dBFS:.1f}, average dBFS: {recent_audio.dBFS:.1f}")
-                      print(f"Silence threshold: {silence_threshold} dB, Min silence len: {min_silence_len} ms")
-                      print(f"Silence ranges found: {len(silence_ranges)}")
+                      audio_array = numpy.array(recent_audio.get_array_of_samples())
+                    #   min_sample = numpy.min(numpy.abs(audio_array))
+                    #   print(f"Audio segment length: {len(recent_audio)}ms, Max dBFS: {recent_audio.max_dBFS:.1f}, average dBFS: {recent_audio.dBFS:.1f}")
+                    #   print(f"Silence threshold: {silence_threshold} dB, Min silence len: {min_silence_len} ms")
+                    #   print(f"Silence ranges found: {len(silence_ranges)}")
                       if silence_ranges:
                           print(f"Silence ranges: {silence_ranges[:3]}")  # Show first 3 ranges
                     # If recent audio is mostly silence, stop recording
@@ -460,12 +483,11 @@ class SpeechIOService(SpeechService, EasyResource):
                 if should_stop:
                     break
             if buffer:
-              audio_data = sr.AudioData(bytes(buffer), 44100, 2)
+              audio_data = sr.AudioData(bytes(buffer), sample_rate, sample_width)
               return await self.convert_audio_to_text(audio_data)
 
         elif rec_state.rec is not None and rec_state.mic is not None:
             with rec_state.mic as source:
-                # this listens until silence is detected - need to implement this manually for audio
                 audio = rec_state.rec.listen(source)
             return await self.convert_audio_to_text(audio)
 
@@ -491,7 +513,6 @@ class SpeechIOService(SpeechService, EasyResource):
                 with tempfile.NamedTemporaryFile(delete=False, suffix=f".{format}") as temp_file:
                     temp_file.write(speech)
                     temp_file_path = temp_file.name
-
                 try:
                     # Convert to WAV if needed
                     if format != "wav":
@@ -631,6 +652,94 @@ class SpeechIOService(SpeechService, EasyResource):
             if p:
                 p.terminate()
 
+    def vosk_vad_listen_in_background(self, callback):
+        """VOSK VAD for microphone_client (AudioIn component)"""
+        print("STARTING VOSK VAD WITH MICROPHONE CLIENT")
+        rec_state.vosk_stop_event = asyncio.Event()
+
+        async def vosk_listen_loop():
+            print("IN VOSK LISTEN LOOP")
+            try:
+                print(f"Calling get_audio with microphone_client: {self.microphone_client}")
+                audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
+                print(f"Got audio_stream for VOSK: {audio_stream}")
+            except Exception as e:
+                print(f"ERROR getting audio stream for VOSK: {e}")
+                import traceback
+                traceback.print_exc()
+                return
+
+            # Track phrase timing
+            phrase_start_time = None
+            phrase_time_limit = self.listen_phrase_time_limit
+
+            async for resp in audio_stream:
+                if rec_state.vosk_stop_event.is_set():
+                    print("VOSK stop event set, breaking")
+                    break
+
+                try:
+                    chunk = resp.audio
+                    audio_data = chunk.audio_data
+
+                    # VOSK expects 16kHz mono, check if resampling is needed
+                    sample_rate = chunk.audio_info.sample_rate_hz
+
+                    if sample_rate != 16000:
+                        # Resample to 16kHz for VOSK
+                        audio_segment = AudioSegment(
+                            data=audio_data,
+                            sample_width=2,  # 16-bit = 2 bytes
+                            frame_rate=sample_rate,
+                            channels=1
+                        )
+                        audio_segment = audio_segment.set_frame_rate(16000)
+                        audio_data = audio_segment.raw_data
+
+                    # Feed data to VOSK recognizer
+                    if rec_state.vosk_rec.AcceptWaveform(audio_data):
+                        result = json.loads(rec_state.vosk_rec.Result())
+                        if result.get('text', '').strip():
+                            # Speech detected
+                            if phrase_start_time is None:
+                                phrase_start_time = time.time()
+                                self.logger.debug("Vosk VAD: Phrase started")
+
+                            # Check phrase time limit
+                            if phrase_time_limit and phrase_start_time:
+                                elapsed_time = time.time() - phrase_start_time
+                                if elapsed_time >= phrase_time_limit:
+                                    self.logger.debug(f"Vosk VAD: Phrase time limit reached ({elapsed_time:.1f}s)")
+                                    phrase_start_time = None
+                                    continue
+
+                            self.vosk_vad_callback(result['text'])
+                        else:
+                            # No speech detected, reset phrase timing
+                            if phrase_start_time is not None:
+                                self.logger.debug("Vosk VAD: Phrase ended (no speech)")
+                                phrase_start_time = None
+
+                except Exception as e:
+                    print(f"Error processing VOSK audio chunk: {e}")
+                    import traceback
+                    traceback.print_exc()
+                    continue
+
+            print("VOSK listen loop ended")
+
+        # Start the async loop in a task
+        task = asyncio.create_task(vosk_listen_loop())
+
+        def stopper(wait_for_stop=True):
+            print("VOSK VAD STOPPER CALLED")
+            rec_state.vosk_stop_event.set()
+            if wait_for_stop:
+                # Cancel the task
+                task.cancel()
+
+        return stopper
+
     def start_vosk_vad(self):
         """Start Vosk VAD if available"""
         if not VOSK_AVAILABLE:
@@ -651,10 +760,18 @@ class SpeechIOService(SpeechService, EasyResource):
 
             rec_state.vosk_model = vosk.Model(model_path)
             rec_state.vosk_rec = vosk.KaldiRecognizer(rec_state.vosk_model, 16000)
-            rec_state.vosk_stop_event = threading.Event()
 
-            rec_state.vosk_thread = threading.Thread(target=self.vosk_vad_thread, daemon=True)
-            rec_state.vosk_thread.start()
+            # Use microphone_client if available, otherwise use PyAudio
+            if self.microphone_client is not None:
+                self.logger.info("Starting Vosk VAD with microphone_client (AudioIn component)")
+                rec_state.vosk_stop_event = asyncio.Event()
+                # Start the async version for microphone_client
+                rec_state.vosk_closer = self.vosk_vad_listen_in_background(self.vosk_vad_callback)
+            else:
+                self.logger.info("Starting Vosk VAD with PyAudio")
+                rec_state.vosk_stop_event = threading.Event()
+                rec_state.vosk_thread = threading.Thread(target=self.vosk_vad_thread, daemon=True)
+                rec_state.vosk_thread.start()
 
             self.logger.info("Started Vosk VAD for voice activity detection")
             return True
@@ -701,7 +818,13 @@ class SpeechIOService(SpeechService, EasyResource):
             return False
 
     def stop_vosk_vad(self):
-        """Stop Vosk VAD"""
+        """Stop Vosk VAD (handles both microphone_client and PyAudio versions)"""
+        # Stop async version (microphone_client)
+        if rec_state.vosk_closer is not None:
+            rec_state.vosk_closer(wait_for_stop=True)
+            rec_state.vosk_closer = None
+
+        # Stop threaded version (PyAudio)
         if rec_state.vosk_stop_event:
             rec_state.vosk_stop_event.set()
         if rec_state.vosk_thread and rec_state.vosk_thread.is_alive():
@@ -805,7 +928,6 @@ class SpeechIOService(SpeechService, EasyResource):
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ):
-        print("RECONFIG")
         try:
             self.main_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -850,7 +972,8 @@ class SpeechIOService(SpeechService, EasyResource):
         self.trigger_active = False
         self.active_trigger_type = ""
         self.stt = None
-        self.audio= str(attrs.get("audio", ""))
+        self.microphone = str(attrs.get("microphone_name", ""))
+        self.speaker = str(attrs.get("speaker_name", ""))
 
         if (
             self.speech_provider == SpeechProvider.elevenlabs
@@ -864,64 +987,89 @@ class SpeechIOService(SpeechService, EasyResource):
             stt = dependencies[SpeechService.get_resource_name(self.stt_provider)]
             self.stt = cast(SpeechService, stt)
 
+        # Set up microphone client if microphone_name is specified
+        if self.microphone != "":
+            mic = dependencies[AudioIn.get_resource_name(self.microphone)]
+            self.microphone_client = cast(AudioIn, mic)
+        else:
+            self.microphone_client = None
 
-        if self.stt_provider != "google":
-            stt = dependencies[SpeechService.get_resource_name(self.stt_provider)]
-            self.stt = cast(SpeechService, stt)
 
-        if self.audio != "":
-            aud = dependencies[Audio.get_resource_name(self.audio)]
-            self.audio_client = cast(Audio, aud)
+        if self.speaker != "":
+            speaker = dependencies[AudioOut.get_resource_name(self.speaker)]
+            self.speaker_client = cast(AudioOut, speaker)
+        else:
+            self.speaker_client = None
 
-        print(self.audio_client)
+        # Track audio playing state for speaker_client
+        self.is_playing_audio = False
 
-        if not self.disable_audioout:
+        if not self.disable_audioout and self.speaker_client is not None:
             if not mixer.get_init():
                 try:
                     mixer.init(buffer=1024)
                 except Exception as err:
-                    os.environ["PULSE_SERVER"] = "/run/user/1000/pulse/native"
-                    mixer.init(buffer=1024)
+                    try:
+                        # try with pulse server
+                        os.environ["PULSE_SERVER"] = "/run/user/1000/pulse/native"
+                        mixer.init(buffer=1024)
+                    except Exception as e:
+                        self.logger.warning(f"Failed to initialize pygame mixer: {e}")
+                        self.logger.warning("Audio playback via pygame will not be available")
         else:
             if mixer.get_init():
                 mixer.quit()
 
         rec_state.rec = sr.Recognizer()
 
-        if not self.disable_mic:
+        # Only set up pygame microphone if microphone is not configured
+        if not self.disable_mic and self.microphone == "":
             # Stop any existing VAD
             if rec_state.listen_closer is not None:
                 rec_state.listen_closer(True)
             self.stop_vosk_vad()
 
-            # Set up speech recognition
+            # Set up speech recognition with pygame microphone
             rec_state.rec.dynamic_energy_threshold = True
 
-            mics = sr.Microphone.list_microphone_names()
+            try:
+                mics = sr.Microphone.list_microphone_names()
 
-            if self.mic_device_name != "":
-                rec_state.mic = sr.Microphone(mics.index(self.mic_device_name))
-            else:
-                rec_state.mic = sr.Microphone()
+                if self.mic_device_name != "":
+                    rec_state.mic = sr.Microphone(mics.index(self.mic_device_name))
+                else:
+                    rec_state.mic = sr.Microphone()
 
-            with rec_state.mic as source:
-                rec_state.rec.adjust_for_ambient_noise(source, 2)
+                if rec_state.mic is not None:
+                    with rec_state.mic as source:
+                        rec_state.rec.adjust_for_ambient_noise(source, 2)
+                else:
+                    self.logger.warning("Microphone is None")
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize pygame microphone: {e}")
+                rec_state.mic = None
 
-                # # Try Vosk VAD first if enabled
-                # if self.use_vosk_vad and self.start_vosk_vad():
-                #     self.logger.info("Using Vosk VAD for voice activity detection")
-                # else:
-                #     # Fall back to speech_recognition VAD
-                #     self.logger.info("Using speech_recognition VAD")
-                #     rec_state.listen_closer = rec_state.rec.listen_in_background(
-                #         source=rec_state.mic,
-                #         phrase_time_limit=self.listen_phrase_time_limit,
-                #         callback=self.listen_callback,
-                #     )
-                   # set up background listening if desired
+        # Set up background listening
         if self.should_listen:
-                self.logger.info("Will listen in background")
+            self.logger.info("Will listen in background")
 
-                if self.audio_client is not None:
+            # Try Vosk VAD first if enabled
+            if self.use_vosk_vad and self.start_vosk_vad():
+                self.logger.info("Using Vosk VAD for voice activity detection")
+            else:
+                # Fall back to regular speech recognition VAD
+                if self.microphone_client is not None:
+                    # Use microphone_client for listening
+                    self.logger.info("Using audioin component for microphone input")
                     rec_state.listen_closer = self.audio_listen_in_background(self.listen_callback)
+                elif rec_state.mic is not None:
+                    # Use pygame microphone for listening
+                    self.logger.info("Using pygame microphone for input")
+                    rec_state.listen_closer = rec_state.rec.listen_in_background(
+                        source=rec_state.mic,
+                        phrase_time_limit=self.listen_phrase_time_limit,
+                        callback=self.listen_callback,
+                    )
+                else:
+                    self.logger.warning("No microphone available for background listening")
 
