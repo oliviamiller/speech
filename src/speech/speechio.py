@@ -22,7 +22,7 @@ from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model
 from viam.utils import struct_to_dict
 
-import numpy
+import numpy as np
 import pygame
 from pygame import mixer
 from elevenlabs.client import ElevenLabs
@@ -268,7 +268,6 @@ class SpeechIOService(SpeechService, EasyResource):
 
     # Background listening using audio client
     def audio_listen_in_background(self, callback):
-        print("STARTING LISTENING IN BACKGROUND")
         rec_state.audio_stop_event = asyncio.Event()
         async def listen_loop():
             print("IN LISTEN LOOP")
@@ -287,10 +286,8 @@ class SpeechIOService(SpeechService, EasyResource):
 
             # Create WebRTC VAD once (aggressiveness 0-3, where 2 is balanced)
             vad = webrtcvad.Vad(3)
-            print("WebRTC VAD created")
 
             # WebRTC VAD requires specific frame sizes: 10, 20, or 30ms
-            # For 44100 Hz, 20ms = 882 samples = 1764 bytes (16-bit)
             frame_duration = 20  # ms
 
             is_speech = False
@@ -359,9 +356,6 @@ class SpeechIOService(SpeechService, EasyResource):
                 if wait_for_stop and rec_state.audio_listen_task:
                         rec_state.audio_listen_task.cancel()
         return stop_listening
-
-
-
 
 
     async def completion(
@@ -471,11 +465,9 @@ class SpeechIOService(SpeechService, EasyResource):
                           print(f"Silence ranges: {silence_ranges[:3]}")  # Show first 3 ranges
                     # If recent audio is mostly silence, stop recording
                       if silence_ranges:
-                          print("here silence range")
                           # Check if there's a silience period that's long enough
                           for silence_start, silence_end in silence_ranges:
                               silence_duration = silence_end - silence_start
-                              print(silence_duration)
                               if silence_duration >= min_silence_len:
                                   print("Silence detected, stopping recording")
                                   should_stop = True
@@ -851,9 +843,6 @@ class SpeechIOService(SpeechService, EasyResource):
         self.logger.info("speechio heard " + heard)
 
         if heard != "":
-            print(self.trigger_active)
-            print(self.active_trigger_type)
-            print(self.listen_trigger_command)
             if (
                 self.should_listen and re.search(".*" + self.listen_trigger_say, heard)
             ) or (self.trigger_active and self.active_trigger_type == "say"):
@@ -878,10 +867,8 @@ class SpeechIOService(SpeechService, EasyResource):
                 and re.search(".*" + self.listen_trigger_command, heard)
             ) or (self.trigger_active and self.active_trigger_type == "command"):
                 self.trigger_active = False
-                print("here trigger command")
                 command = re.sub(".*" + self.listen_trigger_command + r"\s+", "", heard)
                 self.command_list.insert(0, command)
-                print("adding to command list")
                 self.logger.debug("added to command_list: '" + command + "'")
                 del self.command_list[self.listen_command_buffer_length :]
             if not self.should_listen:
@@ -891,7 +878,6 @@ class SpeechIOService(SpeechService, EasyResource):
                     rec_state.listen_closer()
 
     async def convert_audio_to_text(self, audio: sr.AudioData) -> str:
-        print("CONVERTING AUDIO TO TEXT")
         try:
             if self.stt is not None:
                 self.logger.info("getting wav data")
