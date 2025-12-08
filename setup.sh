@@ -36,4 +36,4 @@ fi
 source $VIRTUAL_ENV/bin/activate
 
 echo "Virtualenv found/created. Installing/upgrading Python packages..."
-uv pip install -r requirements.txt -q
+uv pip install --prerelease=allow -r requirements.txt -q

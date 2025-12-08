@@ -178,7 +178,7 @@ class SpeechIOService(SpeechService, EasyResource):
         if str == "":
             raise ValueError("No text provided")
 
-        self.logger.info("Generating audio...")
+        self.logger.debug("Generating audio...")
         if not os.path.isdir(CACHEDIR):
             os.mkdir(CACHEDIR)
 
@@ -572,8 +572,16 @@ class SpeechIOService(SpeechService, EasyResource):
               return await self.convert_audio_to_text(audio_data)
 
         elif rec_state.rec is not None and rec_state.mic is not None:
-            with rec_state.mic as source:
-                audio = rec_state.rec.listen(source)
+            if self.use_new_listener:
+                if segment := self.listener.wait_for_speech():
+                    audio = sr.AudioData(
+                        segment.audio_data, segment.sample_rate, segment.sample_width
+                    )
+                else:
+                    return ""
+            else:
+                with rec_state.mic as source:
+                    audio = rec_state.rec.listen(source)
             return await self.convert_audio_to_text(audio)
 
 
@@ -587,7 +595,7 @@ class SpeechIOService(SpeechService, EasyResource):
 
         self.logger.debug(f"using {self.stt_provider} stt")
         if rec_state.rec is not None:
-            self.logger.info("rec_state.rec is not None")
+            self.logger.debug("rec_state.rec is not None")
 
             # Use temporary file for speech_recognition
             import tempfile
@@ -645,8 +653,11 @@ class SpeechIOService(SpeechService, EasyResource):
             return mp3_fp.getvalue()
 
     def vosk_vad_callback(self, text: str):
-        """Callback for Vosk VAD when speech is detected"""
-        self.logger.info(f"Vosk VAD detected speech: '{text}'")
+        """Callback for Vosk VAD when speech is detected.
+        Note: Vosk doesn't provide alternatives, so fuzzy matching works
+        but multi-alternative search is not available.
+        """
+        self.logger.debug(f"Vosk VAD detected speech: '{text}'")
 
         if not self.main_loop or not self.main_loop.is_running():
             self.logger.error("Main event loop is not available for Vosk VAD task.")
@@ -748,7 +759,7 @@ class SpeechIOService(SpeechService, EasyResource):
                                     phrase_start_time = None
                                     continue
 
-                            self.vosk_vad_callback(result['text'])
+                                self.vosk_vad_callback(result["text"])
                         else:
                             # No speech detected, reset phrase timing
                             if phrase_start_time is not None:
@@ -884,7 +895,7 @@ class SpeechIOService(SpeechService, EasyResource):
             rec_state.vosk_thread = threading.Thread(target=self.vosk_vad_thread, daemon=True)
             rec_state.vosk_thread.start()
 
-            self.logger.info("Started Vosk VAD for voice activity detection")
+            self.logger.debug("Started Vosk VAD for voice activity detection")
             return True
 
         except Exception as e:
@@ -905,7 +916,7 @@ class SpeechIOService(SpeechService, EasyResource):
             model_path = os.path.expanduser(f"~/{model_name}")
             zip_path = os.path.expanduser(f"~/{model_name}.zip")
 
-            self.logger.info(f"Downloading Vosk model from {model_url}")
+            self.logger.debug(f"Downloading Vosk model from {model_url}")
 
             # Download the model
             urllib.request.urlretrieve(model_url, zip_path)
@@ -1394,16 +1405,49 @@ class SpeechIOService(SpeechService, EasyResource):
                 # Try Vosk VAD first if enabled
                 if self.use_vosk_vad and self.start_vosk_vad():
                     self.logger.info("Using Vosk VAD for voice activity detection")
-                elif rec_state.mic is not None:
+                elif self.use_new_listener:
+                    vad_type = self.vad_config.get("type")
+                    vad_kwargs = self.vad_config.copy()
+                    vad_kwargs.pop("type", None)
+                    vad = None
+
+                    if vad_type == "energy":
+                        vad = EnergyVAD(**vad_kwargs)
+                    elif vad_type == "webrtc":
+                        vad = WebRTCVAD(**vad_kwargs)
+                    elif vad_type == "silero":
+                        vad = SileroVAD(**vad_kwargs)
+                    self.logger.debug(
+                        f"Using new listener with vad: {self.vad_config.get('type')}"
+                    )
+                    self.listener = Listener(
+                        source=SpeechRecognitionSource(rec_state.mic),
+                        vad=vad,
+                        on_error=lambda err: self.logger.error(
+                            f"new listener error: {err}"
+                        ),
+                        on_speech=lambda segment: self.listen_callback(
+                            None,
+                            sr.AudioData(
+                                segment.audio_data,
+                                segment.sample_rate,
+                                segment.sample_width,
+                            ),
+                        ),
+                    )
+                    def pipeline_closer(wait_for_stop=True):
+                        self.listener.stop()
+
+                    rec_state.listen_closer = pipeline_closer
+                    self.listener.start()
+                else:
                     # Fall back to speech_recognition VAD
-                    self.logger.info("Using speech_recognition VAD")
+                    self.logger.debug("Using speech_recognition VAD")
                     rec_state.listen_closer = rec_state.rec.listen_in_background(
                         source=rec_state.mic,
                         phrase_time_limit=self.listen_phrase_time_limit,
                         callback=self.listen_callback,
                     )
-                else:
-                    self.logger.warning("No microphone available for background listening")
 
     async def do_command(
         self,
