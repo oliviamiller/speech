@@ -28,8 +28,8 @@ if [ ! "$(command -v uv)" ]; then
   curl -LsSf https://astral.sh/uv/install.sh | sh
 fi
 
-if ! uv venv --allow-existing $VIRTUAL_ENV; then
-  echo "unable to create required virtual environment"
+if ! uv venv --allow-existing --python python3.11 $VIRTUAL_ENV; then
+  echo "unable to create required virtual environment with python3.11"
   exit 1
 fi
 
