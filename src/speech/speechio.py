@@ -269,7 +269,9 @@ class SpeechIOService(SpeechService, EasyResource):
     # Background listening using audio client
     def audio_listen_in_background(self, callback):
         rec_state.audio_stop_event = asyncio.Event()
+
         async def listen_loop():
+            audio_stream = None
             print("IN LISTEN LOOP")
             try:
                 print(f"Calling get_audio with microphone_client: {self.microphone_client}")
@@ -344,17 +346,43 @@ class SpeechIOService(SpeechService, EasyResource):
                                     break
                         except Exception as e:
                             print(f"VAD error: {e}")
+            except asyncio.CancelledError:
+                print("Listen loop cancelled cleanly")
             except Exception as e:
                 print(f"FATAL ERROR in listen_loop: {e}")
+                import traceback
+                traceback.print_exc()
+            finally:
+                # Clean up audio stream
+                if audio_stream is not None:
+                    try:
+                        await audio_stream.aclose()
+                        print("Audio stream closed")
+                    except Exception as e:
+                        print(f"Error closing audio stream: {e}")
+
         # Create task in the event loop
         rec_state.audio_listen_task = asyncio.create_task(listen_loop())
 
-        # Return stop
+        # Return stop function
         def stop_listening(wait_for_stop=True):
-                if rec_state.audio_stop_event:
-                    rec_state.audio_stop_event.set()
-                if wait_for_stop and rec_state.audio_listen_task:
-                        rec_state.audio_listen_task.cancel()
+            print("stop_listening called")
+            if rec_state.audio_stop_event:
+                rec_state.audio_stop_event.set()
+            if rec_state.audio_listen_task and not rec_state.audio_listen_task.done():
+                rec_state.audio_listen_task.cancel()
+                if wait_for_stop:
+                    # Schedule cleanup of task
+                    async def cleanup():
+                        try:
+                            await rec_state.audio_listen_task
+                        except asyncio.CancelledError:
+                            pass
+                        # Clear the stop event for next use
+                        if rec_state.audio_stop_event:
+                            rec_state.audio_stop_event.clear()
+                        print("Cleanup complete")
+                    asyncio.create_task(cleanup())
         return stop_listening
 
 
@@ -838,6 +866,7 @@ class SpeechIOService(SpeechService, EasyResource):
             heard = future.result(timeout=15)
         except Exception as e:
             self.logger.error(f"STT task failed: {e}")
+            rec_state.stt_in_progress = False
             return
 
         self.logger.info("speechio heard " + heard)
