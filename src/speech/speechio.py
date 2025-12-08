@@ -1,11 +1,22 @@
 from io import BytesIO
-from typing import Callable, ClassVar, Mapping, Optional, Protocol, Sequence, cast
+from typing import (
+    Callable,
+    ClassVar,
+    Iterator,
+    Mapping,
+    Optional,
+    Protocol,
+    Sequence,
+    Tuple,
+    cast,
+    Dict,
+)
 from enum import Enum
+from datetime import datetime
 import os
 import re
 import asyncio
 import hashlib
-import wave
 import time
 import threading
 import pyaudio
@@ -20,7 +31,7 @@ from viam.components.audio_in import AudioIn
 from viam.components.audio_out import AudioOut
 from viam.resource.easy_resource import EasyResource
 from viam.resource.types import Model
-from viam.utils import struct_to_dict
+from viam.utils import struct_to_dict, ValueTypes
 
 import numpy as np
 import pygame
@@ -33,14 +44,24 @@ import speech_recognition as sr
 from pydub import AudioSegment, silence
 import webrtcvad
 import tempfile
+from google.cloud.speech import (
+    RecognizeResponse,
+)
+from hearken import Listener, EnergyVAD, WebRTCVAD, SileroVAD
+from hearken.adapters.sr import SpeechRecognitionSource
 
 try:
     import vosk
+
     VOSK_AVAILABLE = True
 except ImportError:
     VOSK_AVAILABLE = False
 
 from speech_service_api import SpeechService
+
+AUDIO_DIR = os.environ.get(
+    "VIAM_MODULE_DATA", os.path.join(os.path.expanduser("~"), ".data", "audio")
+)
 
 
 class SpeechProvider(str, Enum):
@@ -66,6 +87,8 @@ class RecState:
     vosk_stream: Optional[object] = None
     vosk_thread: Optional[threading.Thread] = None
     vosk_stop_event: Optional[threading.Event] = None
+    # Audio playback interrupt flag
+    playback_stop_requested: bool = False
     vosk_closer: Optional[Callable] = None  # For microphone_client version
     # new AUDIO API fields
     audio_listen_task: Optional[asyncio.Task] = None
@@ -98,6 +121,7 @@ class SpeechIOService(SpeechService, EasyResource):
     completion_persona: str
     should_listen: bool
     stt_provider: str
+    stt_provider_config: dict = {}
     listen_trigger_say: str
     listen_trigger_completion: str
     listen_trigger_command: str
@@ -108,8 +132,11 @@ class SpeechIOService(SpeechService, EasyResource):
     active_trigger_type: str
     disable_mic: bool
     disable_audioout: bool
-    eleven_client: dict = {}
+    eleven_client: Mapping[str, ElevenLabs] = {}
     main_loop: Optional[asyncio.AbstractEventLoop] = None
+    listen_trigger_fuzzy_matching: bool
+    listen_trigger_fuzzy_threshold: int
+    fuzzy_matcher: Optional[object] = None
     microphone: str
     microphone_client: Optional[AudioIn] = None
     speaker: str
@@ -122,7 +149,9 @@ class SpeechIOService(SpeechService, EasyResource):
         return super().new(config, dependencies)
 
     @classmethod
-    def validate_config(cls, config: ComponentConfig) -> Sequence[str]:
+    def validate_config(
+        cls, config: ComponentConfig
+    ) -> Tuple[Sequence[str], Sequence[str]]:
         """This method allows you to validate the configuration object received from the machine,
         as well as to return any implicit dependencies based on that `config`.
 
@@ -130,12 +159,12 @@ class SpeechIOService(SpeechService, EasyResource):
             config (ComponentConfig): The configuration for this resource
 
         Returns:
-            Sequence[str]: A list of implicit dependencies
+            Tuple[Sequence[str], Sequence[str]]: A pair of lists of implicit and optional dependencies
         """
         deps = []
         attrs = struct_to_dict(config.attributes)
         stt_provider = str(attrs.get("stt_provider", ""))
-        if stt_provider != "" and stt_provider != "google":
+        if stt_provider != "" and "google" not in stt_provider:
             deps.append(stt_provider)
         microphone = str(attrs.get("microphone_name", ""))
         if microphone != "":
@@ -143,7 +172,7 @@ class SpeechIOService(SpeechService, EasyResource):
         speaker = str(attrs.get("speaker_name", ""))
         if speaker != "":
             deps.append(speaker)
-        return deps
+        return deps, []
 
     async def say(self, text: str, blocking: bool, cache_only: bool = False) -> str:
         if str == "":
@@ -163,12 +192,12 @@ class SpeechIOService(SpeechService, EasyResource):
         )
         try:
             if self.speech_provider == "elevenlabs":
-                audio = self.eleven_client["client"].generate(
-                    text=text, voice=self.speech_voice
+                audio = self.eleven_client["client"].text_to_speech.convert(
+                    text=text, **self.speech_generation_config
                 )
                 eleven_save(audio=audio, filename=file)
             else:
-                sp = gTTS(text=text, lang="en", slow=False)
+                sp = gTTS(text=text, **self.speech_generation_config)
                 sp.save(file)
                 audio_bytes = BytesIO()
                 sp.write_to_fp(audio_bytes)
@@ -215,12 +244,24 @@ class SpeechIOService(SpeechService, EasyResource):
                   # Fallback to pygame mixer if no speaker_client
                 if not cache_only:
                         mixer.music.load(file)
+                rec_state.playback_stop_requested = (
+                    False  # Reset stop flag for new playback
+                )
                         self.logger.debug("Playing audio...")
                         mixer.music.play()  # Play it
 
-                        if blocking:
-                            while mixer.music.get_busy():
-                                pygame.time.Clock().tick()
+                if blocking:
+                    while (
+                        mixer.music.get_busy() and not rec_state.playback_stop_requested
+                    ):
+                        pygame.time.Clock().tick(10)
+
+                    # Reset stop flag after breaking out of loop
+                    if rec_state.playback_stop_requested:
+                        rec_state.playback_stop_requested = False
+                        self.logger.debug(
+                            "say() blocking loop interrupted by stop request"
+                        )
 
         except RuntimeError as err:
                 self.logger.info("error")
@@ -386,6 +427,33 @@ class SpeechIOService(SpeechService, EasyResource):
         return stop_listening
 
 
+    async def stop_playback(self) -> bool:
+        """Stop any currently playing audio.
+
+        This method can be called from any thread to interrupt audio playback.
+        It will stop the current audio immediately and interrupt any blocking
+        wait loops in say().
+
+        Returns:
+            bool: True if playback was stopped, False if nothing was playing
+
+        Example:
+            # From async context
+            await speech_service.stop_playback()
+
+            # From background thread
+            asyncio.run_coroutine_threadsafe(
+                speech_service.stop_playback(),
+                speech_service.main_loop
+            )
+        """
+        if mixer.music.get_busy():
+            rec_state.playback_stop_requested = True
+            mixer.music.stop()
+            self.logger.debug("Playback stopped by external request")
+            return True
+        return False
+
     async def completion(
         self, text: str, blocking: bool, cache_only: bool = False
     ) -> str:
@@ -517,10 +585,10 @@ class SpeechIOService(SpeechService, EasyResource):
 
     async def to_text(self, speech: bytes, format: str = "mp3"):
         if self.stt is not None:
-            self.logger.info("using stt provider")
+            self.logger.debug("using stt provider")
             return await self.stt.to_text(speech, format)
 
-        self.logger.info("using google stt")
+        self.logger.debug(f"using {self.stt_provider} stt")
         if rec_state.rec is not None:
             self.logger.info("rec_state.rec is not None")
 
@@ -530,13 +598,16 @@ class SpeechIOService(SpeechService, EasyResource):
 
             try:
                 # Create temporary file with proper extension
-                with tempfile.NamedTemporaryFile(delete=False, suffix=f".{format}") as temp_file:
+                with tempfile.NamedTemporaryFile(
+                    delete=False, suffix=f".{format}"
+                ) as temp_file:
                     temp_file.write(speech)
                     temp_file_path = temp_file.name
+
                 try:
                     # Convert to WAV if needed
                     if format != "wav":
-                        self.logger.info(f"Converting {format} to WAV")
+                        self.logger.debug(f"Converting {format} to WAV")
                         sound = AudioSegment.from_file(temp_file_path, format=format)
                         wav_path = temp_file_path.replace(f".{format}", ".wav")
                         sound.export(wav_path, format="wav")
@@ -564,13 +635,15 @@ class SpeechIOService(SpeechService, EasyResource):
 
     async def to_speech(self, text):
         if self.speech_provider == "elevenlabs":
-            audio = self.eleven_client["client"].generate(
-                text=text, voice=self.speech_voice
+            audio = self.eleven_client["client"].text_to_speech.convert(
+                text=text, **self.speech_generation_config
             )
+            if isinstance(audio, Iterator):
+                audio = b"".join(audio)
             return audio
         else:
             mp3_fp = BytesIO()
-            sp = gTTS(text=text, lang="en", slow=False)
+            sp = gTTS(text=text, **self.speech_generation_config)
             sp.write_to_fp(mp3_fp)
             return mp3_fp.getvalue()
 
@@ -582,33 +655,56 @@ class SpeechIOService(SpeechService, EasyResource):
             self.logger.error("Main event loop is not available for Vosk VAD task.")
             return
 
-        # Process the detected speech similar to the regular callback
+        # Try fuzzy matching if enabled (no alternatives available with Vosk)
+        if text and self.listen_trigger_fuzzy_matching and self.fuzzy_matcher:
+            match = self._check_fuzzy_triggers(text, alternatives=None)
+            if match:
+                self._handle_trigger_match(match)
+                return
+
+        # Fall back to existing regex-based matching
         if text != "":
             if (
-                self.should_listen and re.search(".*" + self.listen_trigger_say, text)
+                self.should_listen
+                and re.search(".*" + self.listen_trigger_say, text, re.IGNORECASE)
             ) or (self.trigger_active and self.active_trigger_type == "say"):
                 self.trigger_active = False
-                to_say = re.sub(".*" + self.listen_trigger_say + r"\s+", "", text)
+                to_say = re.sub(
+                    ".*" + self.listen_trigger_say + r"\s+",
+                    "",
+                    text,
+                    flags=re.IGNORECASE,
+                )
                 asyncio.run_coroutine_threadsafe(
                     self.say(to_say, blocking=False), self.main_loop
                 )
             elif (
                 self.should_listen
-                and re.search(".*" + self.listen_trigger_completion, text)
+                and re.search(
+                    ".*" + self.listen_trigger_completion, text, re.IGNORECASE
+                )
             ) or (self.trigger_active and self.active_trigger_type == "completion"):
                 self.trigger_active = False
                 to_say = re.sub(
-                    ".*" + self.listen_trigger_completion + r"\s+", "", text
+                    ".*" + self.listen_trigger_completion + r"\s+",
+                    "",
+                    text,
+                    flags=re.IGNORECASE,
                 )
                 asyncio.run_coroutine_threadsafe(
                     self.completion(to_say, blocking=False), self.main_loop
                 )
             elif (
                 self.should_listen
-                and re.search(".*" + self.listen_trigger_command, text)
+                and re.search(".*" + self.listen_trigger_command, text, re.IGNORECASE)
             ) or (self.trigger_active and self.active_trigger_type == "command"):
                 self.trigger_active = False
-                command = re.sub(".*" + self.listen_trigger_command + r"\s+", "", text)
+                command = re.sub(
+                    ".*" + self.listen_trigger_command + r"\s+",
+                    "",
+                    text,
+                    flags=re.IGNORECASE,
+                )
                 self.command_list.insert(0, command)
                 self.logger.debug("added to command_list: '" + command + "'")
                 del self.command_list[self.listen_command_buffer_length :]
@@ -622,7 +718,7 @@ class SpeechIOService(SpeechService, EasyResource):
                 channels=1,
                 rate=16000,
                 input=True,
-                frames_per_buffer=8000
+                frames_per_buffer=8000,
             )
 
             rec_state.vosk_stream = stream
@@ -638,7 +734,7 @@ class SpeechIOService(SpeechService, EasyResource):
                     # Check if we have speech activity
                     if rec_state.vosk_rec.AcceptWaveform(data):
                         result = json.loads(rec_state.vosk_rec.Result())
-                        if result.get('text', '').strip():
+                        if result.get("text", "").strip():
                             # Speech detected
                             if phrase_start_time is None:
                                 phrase_start_time = time.time()
@@ -648,7 +744,9 @@ class SpeechIOService(SpeechService, EasyResource):
                             if phrase_time_limit and phrase_start_time:
                                 elapsed_time = time.time() - phrase_start_time
                                 if elapsed_time >= phrase_time_limit:
-                                    self.logger.debug(f"Vosk VAD: Phrase time limit reached ({elapsed_time:.1f}s)")
+                                    self.logger.debug(
+                                        f"Vosk VAD: Phrase time limit reached ({elapsed_time:.1f}s)"
+                                    )
                                     # Reset for next phrase
                                     phrase_start_time = None
                                     continue
@@ -763,7 +861,9 @@ class SpeechIOService(SpeechService, EasyResource):
     def start_vosk_vad(self):
         """Start Vosk VAD if available"""
         if not VOSK_AVAILABLE:
-            self.logger.warning("Vosk not available, falling back to speech_recognition VAD")
+            self.logger.warning(
+                "Vosk not available, falling back to speech_recognition VAD"
+            )
             return False
 
         try:
@@ -771,27 +871,21 @@ class SpeechIOService(SpeechService, EasyResource):
             # You can download models from https://alphacephei.com/vosk/models
             model_path = os.path.expanduser("~/vosk-model-small-en-us-0.15")
             if not os.path.exists(model_path):
-                self.logger.info("Vosk model not found, attempting to download...")
+                self.logger.debug("Vosk model not found, attempting to download...")
                 if self.download_vosk_model():
-                    self.logger.info("Successfully downloaded Vosk model")
+                    self.logger.debug("Successfully downloaded Vosk model")
                 else:
-                    self.logger.warning("Failed to download Vosk model, falling back to speech_recognition VAD")
+                    self.logger.warning(
+                        "Failed to download Vosk model, falling back to speech_recognition VAD"
+                    )
                     return False
 
             rec_state.vosk_model = vosk.Model(model_path)
             rec_state.vosk_rec = vosk.KaldiRecognizer(rec_state.vosk_model, 16000)
+            rec_state.vosk_stop_event = threading.Event()
 
-            # Use microphone_client if available, otherwise use PyAudio
-            if self.microphone_client is not None:
-                self.logger.info("Starting Vosk VAD with microphone_client (AudioIn component)")
-                rec_state.vosk_stop_event = asyncio.Event()
-                # Start the async version for microphone_client
-                rec_state.vosk_closer = self.vosk_vad_listen_in_background(self.vosk_vad_callback)
-            else:
-                self.logger.info("Starting Vosk VAD with PyAudio")
-                rec_state.vosk_stop_event = threading.Event()
-                rec_state.vosk_thread = threading.Thread(target=self.vosk_vad_thread, daemon=True)
-                rec_state.vosk_thread.start()
+            rec_state.vosk_thread = threading.Thread(target=self.vosk_vad_thread, daemon=True)
+            rec_state.vosk_thread.start()
 
             self.logger.info("Started Vosk VAD for voice activity detection")
             return True
@@ -808,7 +902,9 @@ class SpeechIOService(SpeechService, EasyResource):
             import shutil
 
             model_name = "vosk-model-small-en-us-0.15"
-            model_url = "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+            model_url = (
+                "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
+            )
             model_path = os.path.expanduser(f"~/{model_name}")
             zip_path = os.path.expanduser(f"~/{model_name}.zip")
 
@@ -818,8 +914,8 @@ class SpeechIOService(SpeechService, EasyResource):
             urllib.request.urlretrieve(model_url, zip_path)
 
             # Extract the model
-            self.logger.info("Extracting Vosk model...")
-            with zipfile.ZipFile(zip_path, 'r') as zip_ref:
+            self.logger.debug("Extracting Vosk model...")
+            with zipfile.ZipFile(zip_path, "r") as zip_ref:
                 zip_ref.extractall(os.path.expanduser("~/"))
 
             # Clean up zip file
@@ -827,7 +923,7 @@ class SpeechIOService(SpeechService, EasyResource):
 
             # Verify the model was extracted correctly
             if os.path.exists(model_path):
-                self.logger.info(f"Vosk model downloaded successfully to {model_path}")
+                self.logger.debug(f"Vosk model downloaded successfully to {model_path}")
                 return True
             else:
                 self.logger.error("Failed to extract Vosk model")
@@ -853,50 +949,87 @@ class SpeechIOService(SpeechService, EasyResource):
             rec_state.vosk_stream.close()
 
     def listen_callback(self, recognizer, audio):
-        self.logger.info("speechio heard audio")
-
+        """Process audio with optional fuzzy trigger matching."""
         if not self.main_loop or not self.main_loop.is_running():
             self.logger.error("Main event loop is not available for STT task.")
             return
 
-        future = asyncio.run_coroutine_threadsafe(
-            self.convert_audio_to_text(audio), self.main_loop
-        )
-        try:
-            heard = future.result(timeout=15)
-        except Exception as e:
-            self.logger.error(f"STT task failed: {e}")
-            rec_state.stt_in_progress = False
-            return
+        self.logger.debug("Listen callback got audio")
 
-        self.logger.info("speechio heard " + heard)
+        # Get transcript with alternatives if fuzzy matching is enabled
+        if self.listen_trigger_fuzzy_matching and self.fuzzy_matcher:
+            future = asyncio.run_coroutine_threadsafe(
+                self._convert_audio_to_text_with_alternatives(audio), self.main_loop
+            )
+            try:
+                heard, alternatives = future.result(timeout=15)
+            except Exception as e:
+                self.logger.error(f"STT task failed: {e}")
+                return
 
+            # Try fuzzy matching
+            if heard:
+                self.logger.debug(f"speechio heard: {heard}")
+                match = self._check_fuzzy_triggers(heard, alternatives)
+                if match:
+                    self._handle_trigger_match(match)
+                return
+        else:
+            # Use existing regex-based matching
+            future = asyncio.run_coroutine_threadsafe(
+                self.convert_audio_to_text(audio), self.main_loop
+            )
+            try:
+                heard = future.result(timeout=15)
+            except Exception as e:
+                self.logger.error(f"STT task failed: {e}")
+                return
+
+        # Existing regex-based trigger detection (fallback or when fuzzy disabled)
         if heard != "":
+            self.logger.debug(f"speechio heard: {heard}")
+
             if (
-                self.should_listen and re.search(".*" + self.listen_trigger_say, heard)
+                self.should_listen
+                and re.search(".*" + self.listen_trigger_say, heard, re.IGNORECASE)
             ) or (self.trigger_active and self.active_trigger_type == "say"):
                 self.trigger_active = False
-                to_say = re.sub(".*" + self.listen_trigger_say + r"\s+", "", heard)
+                to_say = re.sub(
+                    ".*" + self.listen_trigger_say + r"\s+",
+                    "",
+                    heard,
+                    flags=re.IGNORECASE,
+                )
                 asyncio.run_coroutine_threadsafe(
                     self.say(to_say, blocking=False), self.main_loop
                 )
             elif (
                 self.should_listen
-                and re.search(".*" + self.listen_trigger_completion, heard)
+                and re.search(
+                    ".*" + self.listen_trigger_completion, heard, re.IGNORECASE
+                )
             ) or (self.trigger_active and self.active_trigger_type == "completion"):
                 self.trigger_active = False
                 to_say = re.sub(
-                    ".*" + self.listen_trigger_completion + r"\s+", "", heard
+                    ".*" + self.listen_trigger_completion + r"\s+",
+                    "",
+                    heard,
+                    flags=re.IGNORECASE,
                 )
                 asyncio.run_coroutine_threadsafe(
                     self.completion(to_say, blocking=False), self.main_loop
                 )
             elif (
                 self.should_listen
-                and re.search(".*" + self.listen_trigger_command, heard)
+                and re.search(".*" + self.listen_trigger_command, heard, re.IGNORECASE)
             ) or (self.trigger_active and self.active_trigger_type == "command"):
                 self.trigger_active = False
-                command = re.sub(".*" + self.listen_trigger_command + r"\s+", "", heard)
+                command = re.sub(
+                    ".*" + self.listen_trigger_command + r"\s+",
+                    "",
+                    heard,
+                    flags=re.IGNORECASE,
+                )
                 self.command_list.insert(0, command)
                 self.logger.debug("added to command_list: '" + command + "'")
                 del self.command_list[self.listen_command_buffer_length :]
@@ -907,38 +1040,169 @@ class SpeechIOService(SpeechService, EasyResource):
                     rec_state.listen_closer()
 
     async def convert_audio_to_text(self, audio: sr.AudioData) -> str:
-        try:
-            if self.stt is not None:
-                self.logger.info("getting wav data")
-                audio_data = audio.get_wav_data()
-                self.logger.info("using stt provider")
-                return await self.stt.to_text(audio_data, format="wav")
+        if self.stt is not None:
+            self.logger.debug("getting wav data")
+            audio_data = audio.get_wav_data()
+            self.logger.debug("using stt provider")
+            return await self.stt.to_text(audio_data, format="wav")
 
             heard = ""
 
-            try:
-                self.logger.info("will convert audio to text")
-                # for testing purposes, we're just using the default API key
-                # to use another API key, use `r.recognize_google(audio, key="GOOGLE_SPEECH_RECOGNITION_API_KEY")`
-                # instead of `r.recognize_google(audio)`
-                transcript = rec_state.rec.recognize_google(audio, show_all=True)
-                self.logger.info("transcript: " + str(transcript))
-                if type(transcript) is dict and transcript.get("alternative"):
-                    heard = transcript["alternative"][0]["transcript"]
-                    self.logger.info("heard: " + heard)
-            except sr.UnknownValueError:
-                self.logger.warning("Google Speech Recognition could not understand audio")
-            except sr.RequestError as e:
-                self.logger.warning(
-                    "Could not request results from Google Speech Recognition service; {0}".format(
-                        e
-                    )
+        try:
+            self.logger.debug("will convert audio to text")
+            response = self._recognize(audio)
+            self.logger.debug("transcript: " + str(response))
+
+            if results := self._get_transcripts(response):
+                heard = results[0]["transcript"]
+                self.logger.debug("heard: " + heard)
+        except sr.UnknownValueError:
+            self.logger.debug("Google Speech Recognition could not understand audio")
+        except sr.RequestError as e:
+            self.logger.error(
+                "Could not request results from Google Speech Recognition service; {0}".format(
+                    e
                 )
-            return heard
-        finally:
-            # Always reset the STT flag when done
-            rec_state.stt_in_progress = False
-            print("STT processing complete, ready for next request")
+            )
+        return heard
+
+    async def _convert_audio_to_text_with_alternatives(
+        self, audio: sr.AudioData
+    ) -> tuple:
+        """Convert audio to text with alternatives for fuzzy matching.
+
+        Returns:
+            Tuple of (primary_transcript, alternatives_list)
+            alternatives_list is None if using external STT provider
+        """
+        if self.stt is not None:
+            # External STT provider - no alternatives available
+            text = await self.stt.to_text(audio.get_wav_data(), format="wav")
+            return text, None
+
+        try:
+            response = self._recognize(audio)
+            self.logger.debug("transcript: " + str(response))
+
+            if results := self._get_transcripts(response):
+                self.logger.debug(f"Transcript results: {results}")
+                primary_text = results[0]["transcript"]
+                return primary_text, results
+
+        except sr.UnknownValueError:
+            self.logger.debug("Google Speech Recognition could not understand audio")
+            if self.save_failed_audio:
+                timestamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                save_audio(audio, f"{AUDIO_DIR}/raw_{timestamp}.wav")
+        except sr.RequestError as e:
+            self.logger.error(
+                f"Could not request results from Google Speech Recognition: {e}"
+            )
+
+        return "", None
+
+    def _recognize(self, audio: sr.AudioData):
+        if self.stt_provider == "google":
+            return rec_state.rec.recognize_google(
+                audio, show_all=True, **self.stt_provider_config
+            )
+        if self.stt_provider == "google_cloud":
+            return rec_state.rec.recognize_google_cloud(
+                audio, show_all=True, **self.stt_provider_config
+            )
+
+    def _get_transcripts(self, response: Dict | RecognizeResponse):
+        if isinstance(response, dict):
+            return response.get("alternative")
+        if isinstance(response, RecognizeResponse) and response.results:
+            self.logger.debug(f"RecognizeResponse results: {response.results}")
+            return [
+                {
+                    "transcript": "".join(
+                        result.alternatives[0].transcript for result in response.results
+                    ),
+                    "confidence": response.results[0].alternatives[0].confidence
+                    if len(response.results) > 0
+                    else 0.0,
+                }
+            ]
+
+        return None
+
+    def _check_fuzzy_triggers(
+        self, heard: str, alternatives: Optional[list]
+    ) -> Optional[object]:
+        """Check all trigger types using fuzzy matching.
+
+        Args:
+            heard: Primary transcript
+            alternatives: List of alternative transcriptions
+
+        Returns:
+            TriggerMatch if a trigger matched, None otherwise
+        """
+        triggers = [
+            ("say", self.listen_trigger_say),
+            ("completion", self.listen_trigger_completion),
+            ("command", self.listen_trigger_command),
+        ]
+
+        for trigger_type, trigger_phrase in triggers:
+            # Check if this trigger should be active
+            should_check = self.should_listen or (
+                self.trigger_active and self.active_trigger_type == trigger_type
+            )
+
+            if not should_check:
+                continue
+
+            # Try fuzzy match
+            match = self.fuzzy_matcher.match_trigger(
+                trigger_phrase, heard, alternatives
+            )
+
+            if match:
+                self.logger.debug(
+                    f"Fuzzy match found: type={trigger_type}, "
+                    f"distance={match.distance}, "
+                    f"confidence={match.confidence:.2f}, "
+                    f"matched='{match.matched_phrase}', "
+                    f"alt_index={match.alternative_index}"
+                )
+
+                # Add trigger type to match
+                match.trigger_type = trigger_type
+                return match
+
+        return None
+
+    def _handle_trigger_match(self, match: object):
+        """Handle a successful trigger match.
+
+        Args:
+            match: TriggerMatch object with match details
+        """
+        self.trigger_active = False
+        command_text = match.command_text
+
+        self.logger.debug(f"Extracted command: '{command_text}'")
+
+        if match.trigger_type == "say":
+            asyncio.run_coroutine_threadsafe(
+                self.say(command_text, blocking=False), self.main_loop
+            )
+        elif match.trigger_type == "completion":
+            asyncio.run_coroutine_threadsafe(
+                self.completion(command_text, blocking=False), self.main_loop
+            )
+        elif match.trigger_type == "command":
+            self.command_list.insert(0, command_text)
+            self.logger.debug(f"added to command_list: '{command_text}'")
+            del self.command_list[self.listen_command_buffer_length :]
+
+        if not self.should_listen:
+            if rec_state.listen_closer is not None:
+                rec_state.listen_closer()
 
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
@@ -954,7 +1218,13 @@ class SpeechIOService(SpeechService, EasyResource):
             str(attrs.get("speech_provider", "google"))
         ]
         self.speech_provider_key = str(attrs.get("speech_provider_key", ""))
-        self.speech_voice = str(attrs.get("speech_voice", "Josh"))
+        self.speech_voice = str(attrs.get("speech_voice", "DWRB4weeqtqHSoQLvPTd"))
+        self.speech_generation_config = attrs.get(
+            "speech_generation_config",
+            {"voice_id": self.speech_voice}
+            if self.speech_provider == "elevenlabs"
+            else {"lang": "en", "slow": False},
+        )
         self.completion_provider = CompletionProvider[
             str(attrs.get("completion_provider", "openai"))
         ]
@@ -966,6 +1236,9 @@ class SpeechIOService(SpeechService, EasyResource):
             openai.organization = self.completion_provider_org
         self.completion_persona = str(attrs.get("completion_persona", ""))
         self.stt_provider = str(attrs.get("stt_provider", "google"))
+        self.stt_provider_config = attrs.get(
+            "stt_provider_config", self.stt_provider_config
+        )
         self.should_listen = bool(attrs.get("listen", False))
         self.listen_phrase_time_limit = attrs.get("listen_phrase_time_limit", None)
         self.mic_device_name = str(attrs.get("mic_device_name", ""))
@@ -982,13 +1255,59 @@ class SpeechIOService(SpeechService, EasyResource):
         self.cache_ahead_completions = bool(attrs.get("cache_ahead_completions", False))
         self.disable_mic = bool(attrs.get("disable_mic", False))
         self.disable_audioout = bool(attrs.get("disable_audioout", False))
-        self.use_vosk_vad = bool(attrs.get("use_vosk_vad", False))  # New option for Vosk VAD
+        self.use_vosk_vad = bool(
+            attrs.get("use_vosk_vad", False)
+        )  # New option for Vosk VAD
         self.command_list = []
         self.trigger_active = False
         self.active_trigger_type = ""
         self.stt = None
         self.microphone = str(attrs.get("microphone_name", ""))
         self.speaker = str(attrs.get("speaker_name", ""))
+
+        # Fuzzy matching configuration
+        self.listen_trigger_fuzzy_matching = bool(
+            attrs.get("listen_trigger_fuzzy_matching", False)
+        )
+        self.listen_trigger_fuzzy_threshold = int(
+            attrs.get("listen_trigger_fuzzy_threshold", 2)
+        )
+        self.save_failed_audio = bool(attrs.get("save_failed_audio", False))
+        self.use_new_listener = bool(attrs.get("use_new_listener", False))
+        self.stt_timeout = int(attrs.get("stt_timeout", 7))
+        self.vad_config = attrs.get("vad_config", {"type": "energy"})
+        self.listen_sample_rate = int(attrs.get("listen_sample_rate", 48000))
+
+        # Stop any existing VAD
+        if rec_state.listen_closer is not None:
+            rec_state.listen_closer(True)
+        self.stop_vosk_vad()
+
+        # Validate threshold
+        if not 0 <= self.listen_trigger_fuzzy_threshold <= 5:
+            self.logger.warning(
+                f"Invalid fuzzy threshold {self.listen_trigger_fuzzy_threshold}, using default 2"
+            )
+            self.listen_trigger_fuzzy_threshold = 2
+
+        # Initialize fuzzy matcher if enabled
+        if self.listen_trigger_fuzzy_matching:
+            try:
+                from src.speech.fuzzy_matcher import FuzzyWakeWordMatcher
+
+                self.fuzzy_matcher = FuzzyWakeWordMatcher(
+                    threshold=self.listen_trigger_fuzzy_threshold
+                )
+                self.logger.debug(
+                    f"Fuzzy matching enabled with threshold={self.listen_trigger_fuzzy_threshold}"
+                )
+            except ImportError as e:
+                self.logger.error(f"Failed to initialize fuzzy matcher: {e}")
+                self.logger.warning("Falling back to regex matching")
+                self.listen_trigger_fuzzy_matching = False
+                self.fuzzy_matcher = None
+        else:
+            self.fuzzy_matcher = None
 
         if (
             self.speech_provider == SpeechProvider.elevenlabs
@@ -998,7 +1317,7 @@ class SpeechIOService(SpeechService, EasyResource):
         else:
             self.speech_provider = SpeechProvider.google
 
-        if self.stt_provider != "google":
+        if "google" not in self.stt_provider:
             stt = dependencies[SpeechService.get_resource_name(self.stt_provider)]
             self.stt = cast(SpeechService, stt)
 
@@ -1036,24 +1355,27 @@ class SpeechIOService(SpeechService, EasyResource):
                 mixer.quit()
 
         rec_state.rec = sr.Recognizer()
+        rec_state.rec.operation_timeout = self.stt_timeout
 
-        # Only set up pygame microphone if microphone is not configured
-        if not self.disable_mic and self.microphone == "":
+        if not self.disable_mic:
             # Stop any existing VAD
             if rec_state.listen_closer is not None:
                 rec_state.listen_closer(True)
             self.stop_vosk_vad()
 
-            # Set up speech recognition with pygame microphone
+            # Set up speech recognition
             rec_state.rec.dynamic_energy_threshold = True
 
             try:
                 mics = sr.Microphone.list_microphone_names()
 
                 if self.mic_device_name != "":
-                    rec_state.mic = sr.Microphone(mics.index(self.mic_device_name))
+                    rec_state.mic = sr.Microphone(
+                    device_index=mics.index(self.mic_device_name),
+                    sample_rate=self.listen_sample_rate,
+                )
                 else:
-                    rec_state.mic = sr.Microphone()
+                    rec_state.mic = sr.Microphone(sample_rate=self.listen_sample_rate)
 
                 if rec_state.mic is not None:
                     with rec_state.mic as source:
@@ -1064,27 +1386,48 @@ class SpeechIOService(SpeechService, EasyResource):
                 self.logger.warning(f"Failed to initialize pygame microphone: {e}")
                 rec_state.mic = None
 
-        # Set up background listening
-        if self.should_listen:
-            self.logger.info("Will listen in background")
+            # set up background listening if desired
+            if self.should_listen:
+                self.logger.info("Will listen in background")
 
-            # Try Vosk VAD first if enabled
-            if self.use_vosk_vad and self.start_vosk_vad():
-                self.logger.info("Using Vosk VAD for voice activity detection")
-            else:
-                # Fall back to regular speech recognition VAD
-                if self.microphone_client is not None:
-                    # Use microphone_client for listening
-                    self.logger.info("Using audioin component for microphone input")
-                    rec_state.listen_closer = self.audio_listen_in_background(self.listen_callback)
-                elif rec_state.mic is not None:
-                    # Use pygame microphone for listening
-                    self.logger.info("Using pygame microphone for input")
+                # Try Vosk VAD first if enabled
+                if self.use_vosk_vad and self.start_vosk_vad():
+                    self.logger.info("Using Vosk VAD for voice activity detection")
+                else:
+                    # Fall back to speech_recognition VAD
+                    self.logger.info("Using speech_recognition VAD")
                     rec_state.listen_closer = rec_state.rec.listen_in_background(
                         source=rec_state.mic,
                         phrase_time_limit=self.listen_phrase_time_limit,
                         callback=self.listen_callback,
                     )
+
+    async def do_command(
+        self,
+        command: Mapping[str, ValueTypes],
+        *,
+        timeout: Optional[float] = None,
+        **kwargs,
+    ) -> Mapping[str, ValueTypes]:
+        if cmd := command.get("command"):
+            if cmd == "stop_playback":
+                stopped = await self.stop_playback()
+                return {"command": cmd, "stopped": stopped}
+        return {"status": "unknown command"}
+
+    async def close(self):
+        if rec_state.listen_closer is not None:
+            rec_state.listen_closer(True)
+        self.stop_vosk_vad()
+
+
+def save_audio(audio_data, filename):
+    """Save AudioData to WAV file"""
+    with wave.open(filename, "wb") as wf:
+        wf.setnchannels(1)  # Mono
+        wf.setsampwidth(audio_data.sample_width)
+        wf.setframerate(audio_data.sample_rate)
+        wf.writeframes(audio_data.get_raw_data())
                 else:
                     self.logger.warning("No microphone available for background listening")
 
