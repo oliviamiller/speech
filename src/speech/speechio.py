@@ -21,7 +21,7 @@ import time
 import threading
 import pyaudio
 import json
-import time
+import wave
 from typing_extensions import Self
 
 from viam.proto.app.robot import ComponentConfig
@@ -241,14 +241,14 @@ class SpeechIOService(SpeechService, EasyResource):
                     #     await self.microphone_client.play(audio_data, "mp3", 44100, 2)
                     #     print("here played audio")
             else:
-                  # Fallback to pygame mixer if no speaker_client
+                # Fallback to pygame mixer if no speaker_client
                 if not cache_only:
-                        mixer.music.load(file)
-                rec_state.playback_stop_requested = (
-                    False  # Reset stop flag for new playback
-                )
-                        self.logger.debug("Playing audio...")
-                        mixer.music.play()  # Play it
+                    mixer.music.load(file)
+                    rec_state.playback_stop_requested = (
+                        False  # Reset stop flag for new playback
+                    )
+                    self.logger.debug("Playing audio...")
+                    mixer.music.play()  # Play it
 
                 if blocking:
                     while (
@@ -313,15 +313,12 @@ class SpeechIOService(SpeechService, EasyResource):
 
         async def listen_loop():
             audio_stream = None
-            print("IN LISTEN LOOP")
             try:
                 print(f"Calling get_audio with microphone_client: {self.microphone_client}")
                 audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
                 print(f"Got audio_stream: {audio_stream}, type: {type(audio_stream)}")
             except Exception as e:
                 print(f"ERROR getting audio stream: {e}")
-                import traceback
-                traceback.print_exc()
                 return
 
             buffer = bytearray()
@@ -1357,43 +1354,47 @@ class SpeechIOService(SpeechService, EasyResource):
         rec_state.rec = sr.Recognizer()
         rec_state.rec.operation_timeout = self.stt_timeout
 
-        if not self.disable_mic:
-            # Stop any existing VAD
-            if rec_state.listen_closer is not None:
-                rec_state.listen_closer(True)
-            self.stop_vosk_vad()
+        # Set up background listening if desired
+        if self.should_listen:
+            self.logger.info("Will listen in background")
 
-            # Set up speech recognition
-            rec_state.rec.dynamic_energy_threshold = True
+            # Use microphone_client if available
+            if self.microphone_client is not None:
+                self.logger.info("Using audio_in component for microphone input")
+                rec_state.listen_closer = self.audio_listen_in_background(self.listen_callback)
+            elif not self.disable_mic:
+                # Stop any existing VAD
+                if rec_state.listen_closer is not None:
+                    rec_state.listen_closer(True)
+                self.stop_vosk_vad()
 
-            try:
-                mics = sr.Microphone.list_microphone_names()
+                # Set up speech recognition
+                rec_state.rec.dynamic_energy_threshold = True
 
-                if self.mic_device_name != "":
-                    rec_state.mic = sr.Microphone(
-                    device_index=mics.index(self.mic_device_name),
-                    sample_rate=self.listen_sample_rate,
-                )
-                else:
-                    rec_state.mic = sr.Microphone(sample_rate=self.listen_sample_rate)
+                try:
+                    mics = sr.Microphone.list_microphone_names()
 
-                if rec_state.mic is not None:
-                    with rec_state.mic as source:
-                        rec_state.rec.adjust_for_ambient_noise(source, 2)
-                else:
-                    self.logger.warning("Microphone is None")
-            except Exception as e:
-                self.logger.warning(f"Failed to initialize pygame microphone: {e}")
-                rec_state.mic = None
+                    if self.mic_device_name != "":
+                        rec_state.mic = sr.Microphone(
+                            device_index=mics.index(self.mic_device_name),
+                            sample_rate=self.listen_sample_rate,
+                        )
+                    else:
+                        rec_state.mic = sr.Microphone(sample_rate=self.listen_sample_rate)
 
-            # set up background listening if desired
-            if self.should_listen:
-                self.logger.info("Will listen in background")
+                    if rec_state.mic is not None:
+                        with rec_state.mic as source:
+                            rec_state.rec.adjust_for_ambient_noise(source, 2)
+                    else:
+                        self.logger.warning("Microphone is None")
+                except Exception as e:
+                    self.logger.warning(f"Failed to initialize pygame microphone: {e}")
+                    rec_state.mic = None
 
                 # Try Vosk VAD first if enabled
                 if self.use_vosk_vad and self.start_vosk_vad():
                     self.logger.info("Using Vosk VAD for voice activity detection")
-                else:
+                elif rec_state.mic is not None:
                     # Fall back to speech_recognition VAD
                     self.logger.info("Using speech_recognition VAD")
                     rec_state.listen_closer = rec_state.rec.listen_in_background(
@@ -1401,6 +1402,8 @@ class SpeechIOService(SpeechService, EasyResource):
                         phrase_time_limit=self.listen_phrase_time_limit,
                         callback=self.listen_callback,
                     )
+                else:
+                    self.logger.warning("No microphone available for background listening")
 
     async def do_command(
         self,
@@ -1428,6 +1431,4 @@ def save_audio(audio_data, filename):
         wf.setsampwidth(audio_data.sample_width)
         wf.setframerate(audio_data.sample_rate)
         wf.writeframes(audio_data.get_raw_data())
-                else:
-                    self.logger.warning("No microphone available for background listening")
 
