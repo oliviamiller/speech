@@ -371,6 +371,7 @@ class SpeechIOService(SpeechService, EasyResource):
                         except Exception as e:
                             self.logger.Error(f"VAD error: {e}")
             except asyncio.CancelledError:
+                    self.logger.Debug("aysncio cancelled")
             except Exception as e:
                 self.logger.Error(f"FATAL ERROR in listen_loop: {e}")
             finally:
