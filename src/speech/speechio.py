@@ -369,18 +369,18 @@ class SpeechIOService(SpeechService, EasyResource):
                                     silence_frames = 0
                                     break
                         except Exception as e:
-                            self.logger.Error(f"VAD error: {e}")
+                            self.logger.error(f"VAD error: {e}")
             except asyncio.CancelledError:
-                    self.logger.Debug("aysncio cancelled")
+                    self.logger.debug("aysncio cancelled")
             except Exception as e:
-                self.logger.Error(f"FATAL ERROR in listen_loop: {e}")
+                self.logger.error(f"FATAL ERROR in listen_loop: {e}")
             finally:
                 # Clean up audio stream
                 if audio_stream is not None:
                     try:
                         await audio_stream.aclose()
                     except Exception as e:
-                        self.logger.Error(f"Error closing audio stream: {e}")
+                        self.logger.error(f"Error closing audio stream: {e}")
 
         # Create task in the event loop
         rec_state.audio_listen_task = asyncio.create_task(listen_loop())
