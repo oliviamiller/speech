@@ -1017,6 +1017,7 @@ class SpeechIOService(SpeechService, EasyResource):
                 if rec_state.listen_closer is not None:
                     rec_state.listen_closer()
 
+
     async def convert_audio_to_text(self, audio: sr.AudioData) -> str:
         if self.stt is not None:
             self.logger.debug("getting wav data")
@@ -1042,6 +1043,8 @@ class SpeechIOService(SpeechService, EasyResource):
                     e
                 )
             )
+        finally:
+            rec_state.stt_in_progress = False
         return heard
 
     async def _convert_audio_to_text_with_alternatives(
