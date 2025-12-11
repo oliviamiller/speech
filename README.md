@@ -95,6 +95,8 @@ The following attributes are available for the `viam-labs:speech:speechio` speec
 | `disable_mic`  | boolean | Optional | If true, will not configure any listening capabilities. This must be set to true if you do not have a valid microphone attached to your system. Default: `false`. |
 | `disable_audioout`  | boolean | Optional | If true, will not configure any audio output capabilities. This must be set to true if you do not have a valid audio output device attached to your system. Default: `false`. |
 | `use_vosk_vad`  | boolean | Optional | If true, will use Vosk for Voice Activity Detection (VAD) instead of the default speech_recognition VAD. The Vosk model will be automatically downloaded (~40MB) on first use. Default: `false`. |
+| `microphone_name` | string | Optional | Name of the viam audioin component to obtain an audio stream from.|
+| `speaker_name` | string | Optional | Name of the vima audioout component to use for audio playback. |
 
 
 ### Example configuration
@@ -111,7 +113,8 @@ The following configuration sets up listening mode with local speech-to-text, us
   "speech_provider": "elevenlabs",
   "speech_provider_key": "keygoeshere",
   "speech_voice": "Antoni",
-  "mic_device_name": "myMic"
+  "microphone_name": "mic-1",
+  "speaker_name": "speaker-1"
 }
 ```
 
@@ -286,7 +289,7 @@ The following attributes are available for this model:
 }
 ```
 
-# Troubleshooting 
+# Troubleshooting
 ## ALSA Configuration Guide for Speechio Service
 
 ## Overview
@@ -310,7 +313,7 @@ First, identify your audio devices:
 # List playback devices
 aplay -l
 
-# List capture devices  
+# List capture devices
 arecord -l
 
 # Check current card assignments
@@ -420,7 +423,7 @@ cat /etc/asound.conf
 ### Issue: No Audio Detected by Speechio
 **Symptom:** No "speechio heard audio" logs when speaking
 
-**Solution:** 
+**Solution:**
 1. Verify microphone with `arecord -l`
 2. Check ALSA configuration with `arecord -D default -f S16_LE -r 16000 -c 1 -t wav /tmp/test.wav`
 3. Ensure `/etc/asound.conf` uses correct device names
@@ -428,7 +431,7 @@ cat /etc/asound.conf
 ### Issue: Configuration Resets After Reboot
 **Symptom:** Audio setup works until machine restarts
 
-**Solution:** 
+**Solution:**
 1. Use `/etc/asound.conf` (not `~/.asoundrc`)
 2. Verify file is not managed by packages: `dpkg -S /etc/asound.conf`
 3. Check file permissions: `sudo chmod 644 /etc/asound.conf`

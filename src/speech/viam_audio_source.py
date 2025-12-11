@@ -20,7 +20,7 @@ class ViamAudioInSource:
     def __init__(
         self,
         microphone_client: AudioIn,
-        sample_rate: int = 16000,
+        sample_rate: int = 0,
         sample_width: int = 2,  # 2 bytes for 16-bit PCM
         chunk_size: int = 1024,
         logger=None
@@ -67,11 +67,18 @@ class ViamAudioInSource:
         try:
             if self.logger:
                 self.logger.debug("Starting Viam audio stream...")
+
+            # Get actual properties from the microphone
+            properties = await self.microphone_client.get_properties()
+            self._sample_rate = properties.sample_rate_hz
+
             self._audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
             # Start the streaming task
             asyncio.create_task(self._stream_audio())
-            self.logger.debug("Viam audio stream started")
+            if self.logger:
+                self.logger.debug("Viam audio stream started")
         except Exception as e:
+            if self.logger:
                 self.logger.error(f"Failed to start Viam audio stream: {e}")
 
     def read(self, num_samples: int) -> bytes:

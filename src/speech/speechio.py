@@ -52,7 +52,6 @@ except ImportError:
 
 from speech_service_api import SpeechService
 from .vosk_handler import VoskHandler
-from .microphone_listener import MicrophoneListener
 from .viam_audio_source import ViamAudioInSource
 
 AUDIO_DIR = os.environ.get(
@@ -127,7 +126,6 @@ class SpeechIOService(SpeechService, EasyResource):
     speaker: str
     speaker_client: Optional[AudioOut] = None
     vosk_handler: Optional[VoskHandler] = None
-    microphone_listener: Optional[MicrophoneListener] = None
     stt_in_progress: bool = False
     listen_closer: Optional[Closer] = None
     is_playing_audio: bool
@@ -276,7 +274,11 @@ class SpeechIOService(SpeechService, EasyResource):
 
             # Use microphone_client if available, otherwise use legacy SR microphone
             if self.microphone_client is not None:
-                self.listen_closer = self.audio_listen_in_background(self.listen_callback)
+                viam_source = ViamAudioInSource(
+                    microphone_client=self.microphone_client,
+                    logger=self.logger
+            )
+                self.listen_closer = self._setup_hearken_listener(viam_source, "microphone_client")
             elif rec_state.rec is not None and rec_state.mic is not None:
                 self.listen_closer = rec_state.rec.listen_in_background(
                     source=rec_state.mic,
@@ -293,17 +295,6 @@ class SpeechIOService(SpeechService, EasyResource):
             return self.is_playing_audio
         else:
             return mixer.music.get_busy()
-
-    # Background listening using viam audioin client
-    def audio_listen_in_background(self, callback):
-        """Start background listening using MicrophoneListener"""
-        self.microphone_listener = MicrophoneListener(
-            logger=self.logger,
-            microphone_client=self.microphone_client,
-            callback=callback,
-            owner=self
-        )
-        return self.microphone_listener.start()
 
 
     async def stop_playback(self) -> bool:
@@ -409,16 +400,15 @@ class SpeechIOService(SpeechService, EasyResource):
                 listener_closer = self._setup_hearken_listener(viam_source, "microphone_client")
 
                 # Give the audio stream a moment to start
-                self.logger.debug("Waiting for audio stream to initialize...")
                 await asyncio.sleep(0.5)  # 500ms for stream to start
 
             # Run wait_for_speech in executor to avoid blocking event loop
-            self.logger.debug("Waiting for speech detection (30s timeout)...")
+            self.logger.debug("Waiting for speech detection")
             loop = asyncio.get_event_loop()
             # Add a 30 second timeout
             segment = await loop.run_in_executor(
                 None,
-                lambda: self.listener.wait_for_speech(timeout=30.0)
+                lambda: self.listener.wait_for_speech()
             )
             self.logger.debug(f"wait_for_speech returned: {segment}")
 
@@ -972,10 +962,9 @@ class SpeechIOService(SpeechService, EasyResource):
 
         # Vosk not enabled/available, set up appropriate fallback VAD
         if self.microphone_client is not None and not self.disable_mic:
-            # Modern path: Use hearken listener with microphone_client
+            # Use hearken listener with microphone_client
             viam_source = ViamAudioInSource(
                 microphone_client=self.microphone_client,
-                sample_rate=self.listen_sample_rate,
                 logger=self.logger
             )
             self.listen_closer = self._setup_hearken_listener(viam_source, "microphone_client")
