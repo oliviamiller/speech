@@ -203,6 +203,9 @@ class SpeechIOService(SpeechService, EasyResource):
 
             if self.speaker_client is not None:
                 if not cache_only:
+                    with open(file, "rb") as f:
+                        audio_bytes = BytesIO(f.read())
+
                     audio_data = audio_bytes.getvalue()
 
                     try:
