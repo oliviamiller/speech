@@ -406,6 +406,10 @@ class SpeechIOService(SpeechService, EasyResource):
                 )
                 self._setup_hearken_listener(viam_source, "microphone_client")
 
+                # Give the audio stream a moment to start
+                self.logger.debug("Waiting for audio stream to initialize...")
+                await asyncio.sleep(0.5)  # 500ms for stream to start
+
             # Run wait_for_speech in executor to avoid blocking event loop
             self.logger.debug("Waiting for speech detection (30s timeout)...")
             loop = asyncio.get_event_loop()
