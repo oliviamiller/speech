@@ -53,6 +53,7 @@ except ImportError:
 from speech_service_api import SpeechService
 from .vosk_handler import VoskHandler
 from .microphone_listener import MicrophoneListener
+from .viam_audio_source import ViamAudioInSource
 
 AUDIO_DIR = os.environ.get(
     "VIAM_MODULE_DATA", os.path.join(os.path.expanduser("~"), ".data", "audio")
@@ -301,7 +302,6 @@ class SpeechIOService(SpeechService, EasyResource):
             logger=self.logger,
             microphone_client=self.microphone_client,
             callback=callback,
-            recognizer=rec_state.rec,
             owner=self
         )
         return self.microphone_listener.start()
@@ -918,6 +918,112 @@ class SpeechIOService(SpeechService, EasyResource):
             if self.listen_closer is not None:
                 self.listen_closer()
 
+    def _setup_hearken_listener(self, source, source_name: str):
+        """Set up hearken Listener with configurable VAD.
+
+        Args:
+            source: Audio source (ViamAudioInSource or SpeechRecognitionSource)
+            source_name: Name for logging (e.g., "microphone_client" or "speech_recognition")
+
+        Returns:
+            Closer function to stop the listener
+        """
+        vad_type = self.vad_config.get("type", "webrtc")
+        vad_kwargs = self.vad_config.copy()
+        vad_kwargs.pop("type", None)
+        vad = None
+
+        if vad_type == "energy":
+            vad = EnergyVAD(**vad_kwargs)
+        elif vad_type == "webrtc":
+            vad = WebRTCVAD(**vad_kwargs)
+        elif vad_type == "silero":
+            vad = SileroVAD(**vad_kwargs)
+
+        self.logger.debug(f"Using hearken listener with {vad_type} VAD and {source_name}")
+
+        self.listener = Listener(
+            source=source,
+            vad=vad,
+            on_error=lambda err: self.logger.error(f"hearken listener error: {err}"),
+            on_speech=lambda segment: self.listen_callback(
+                sr.AudioData(
+                    segment.audio_data,
+                    segment.sample_rate,
+                    segment.sample_width,
+                )
+            ),
+        )
+
+        def listener_closer(wait_for_stop=True):
+            self.listener.stop()
+            if hasattr(source, 'stop'):
+                source.stop()
+
+        self.listener.start()
+        return listener_closer
+
+    def _setup_background_listening(self):
+        """Set up background listening with appropriate VAD based on configuration.
+
+        Sets self.listen_closer to the appropriate closer function.
+        """
+        # Stop any existing VAD before setting up new one
+        if self.listen_closer is not None:
+            self.listen_closer(True)
+        self.stop_vosk_vad()
+
+        # Try Vosk VAD first if enabled (works with both modern and legacy microphones)
+        if self.use_vosk_vad and self.start_vosk_vad():
+            self.logger.debug("Using Vosk VAD for voice activity detection")
+            return  # Vosk VAD handles everything
+
+        # Vosk not enabled/available, set up appropriate fallback VAD
+        if self.microphone_client is not None and not self.disable_mic:
+            # Modern path: Use hearken listener with microphone_client
+            viam_source = ViamAudioInSource(
+                microphone_client=self.microphone_client,
+                sample_rate=self.listen_sample_rate,
+                logger=self.logger
+            )
+            self.listen_closer = self._setup_hearken_listener(viam_source, "microphone_client")
+
+        elif not self.disable_mic:
+            # Legacy path: Set up speech_recognition microphone first
+            rec_state.rec.dynamic_energy_threshold = True
+
+            try:
+                mics = sr.Microphone.list_microphone_names()
+
+                if self.mic_device_name != "":
+                    rec_state.mic = sr.Microphone(
+                        device_index=mics.index(self.mic_device_name),
+                        sample_rate=self.listen_sample_rate,
+                    )
+                else:
+                    rec_state.mic = sr.Microphone(sample_rate=self.listen_sample_rate)
+
+                if rec_state.mic is not None:
+                    with rec_state.mic as source:
+                        rec_state.rec.adjust_for_ambient_noise(source, 2)
+            except Exception as e:
+                self.logger.warning(f"Failed to initialize speech_recognition microphone: {e}")
+                rec_state.mic = None
+
+            # Use hearken Listener with configurable VAD or fallback to speech_recognition
+            if self.use_new_listener:
+                # Use hearken listener with speech_recognition microphone
+                sr_source = SpeechRecognitionSource(rec_state.mic)
+                self.listen_closer = self._setup_hearken_listener(sr_source, "speech_recognition")
+            else:
+                # Fall back to speech_recognition VAD
+                self.logger.debug("Using speech_recognition VAD")
+                self.listen_closer = rec_state.rec.listen_in_background(
+                    source=rec_state.mic,
+                    phrase_time_limit=self.listen_phrase_time_limit,
+                    callback=self.listen_callback,
+                )
+
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
     ):
@@ -1071,98 +1177,7 @@ class SpeechIOService(SpeechService, EasyResource):
 
         if self.should_listen:
             self.logger.debug("Setting up background listening")
-
-            # Stop any existing VAD before setting up new one
-            if self.listen_closer is not None:
-                self.listen_closer(True)
-            self.stop_vosk_vad()
-
-            # Use viam microphone component first if available.
-            if self.microphone_client is not None and not self.disable_mic:
-                self.logger.debug("Using audio_in component for microphone input")
-
-                # Try Vosk VAD first if enabled
-                if self.use_vosk_vad:
-                    if self.start_vosk_vad():
-                        self.logger.debug("Using Vosk VAD with microphone_client")
-                    else:
-                        # Fallback to WebRTC VAD
-                        self.logger.debug("Vosk VAD initialization failed, falling back to WebRTC VAD")
-                        self.listen_closer = self.audio_listen_in_background(self.listen_callback)
-                else:
-                    # Use WebRTC VAD by default
-                    self.listen_closer = self.audio_listen_in_background(self.listen_callback)
-            elif not self.disable_mic:
-
-                # Set up speech recognition
-                rec_state.rec.dynamic_energy_threshold = True
-
-                try:
-                    mics = sr.Microphone.list_microphone_names()
-
-                    if self.mic_device_name != "":
-                        rec_state.mic = sr.Microphone(
-                            device_index=mics.index(self.mic_device_name),
-                            sample_rate=self.listen_sample_rate,
-                        )
-                    else:
-                        rec_state.mic = sr.Microphone(sample_rate=self.listen_sample_rate)
-
-                    if rec_state.mic is not None:
-                        with rec_state.mic as source:
-                            rec_state.rec.adjust_for_ambient_noise(source, 2)
-                except Exception as e:
-                    self.logger.warning(f"Failed to initialize pygame microphone: {e}")
-                    rec_state.mic = None
-
-                # Try Vosk VAD first if enabled
-                if self.use_vosk_vad and self.start_vosk_vad():
-                    self.logger.debug("Using Vosk VAD for voice activity detection")
-                elif self.use_new_listener:
-                    vad_type = self.vad_config.get("type")
-                    vad_kwargs = self.vad_config.copy()
-                    vad_kwargs.pop("type", None)
-                    vad = None
-
-                    if vad_type == "energy":
-                        vad = EnergyVAD(**vad_kwargs)
-                    elif vad_type == "webrtc":
-                        vad = WebRTCVAD(**vad_kwargs)
-                    elif vad_type == "silero":
-                        vad = SileroVAD(**vad_kwargs)
-
-                    self.logger.debug(
-                        f"Using new listener with vad: {self.vad_config.get('type')}"
-                    )
-                    self.listener = Listener(
-                        source=SpeechRecognitionSource(rec_state.mic),
-                        vad=vad,
-                        on_error=lambda err: self.logger.error(
-                            f"new listener error: {err}"
-                        ),
-                        on_speech=lambda segment: self.listen_callback(
-                            None,
-                            sr.AudioData(
-                                segment.audio_data,
-                                segment.sample_rate,
-                                segment.sample_width,
-                            ),
-                        ),
-                    )
-
-                    def pipeline_closer(wait_for_stop=True):
-                        self.listener.stop()
-
-                    self.listen_closer = pipeline_closer
-                    self.listener.start()
-                else:
-                    # Fall back to speech_recognition VAD
-                    self.logger.debug("Using speech_recognition VAD")
-                    self.listen_closer = rec_state.rec.listen_in_background(
-                        source=rec_state.mic,
-                        phrase_time_limit=self.listen_phrase_time_limit,
-                        callback=self.listen_callback,
-                    )
+            self._setup_background_listening()
 
     async def do_command(
         self,

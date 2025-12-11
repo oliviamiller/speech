@@ -8,6 +8,8 @@ import asyncio
 import webrtcvad
 import speech_recognition as sr
 from typing import Callable, Optional
+import numpy as np
+from scipy import signal
 
 
 class MicrophoneListenerState:
@@ -41,6 +43,30 @@ class MicrophoneListener:
         self.owner = owner
         self.state = MicrophoneListenerState()
 
+    def resample_audio(self, audio_data: bytes, orig_rate: int, target_rate: int) -> bytes:
+        """Resample audio data from orig_rate to target_rate.
+
+        Args:
+            audio_data: Raw PCM16 audio bytes
+            orig_rate: Original sample rate in Hz
+            target_rate: Target sample rate in Hz
+
+        Returns:
+            Resampled audio as bytes
+        """
+        # Convert bytes to numpy array (16-bit PCM = int16)
+        audio_array = np.frombuffer(audio_data, dtype=np.int16)
+
+        # Calculate number of samples needed
+        num_samples = int(len(audio_array) * target_rate / orig_rate)
+
+        # Resample using scipy
+        resampled = signal.resample(audio_array, num_samples)
+
+        # Convert back to int16 and bytes
+        resampled_int16 = resampled.astype(np.int16)
+        return resampled_int16.tobytes()
+
     def start(self):
         """Start background listening with WebRTC VAD"""
         self.state.audio_stop_event = asyncio.Event()
@@ -66,19 +92,38 @@ class MicrophoneListener:
             silence_frames = 0
             max_silence_frames = 30  # 30 frames * 20ms = 600ms of silence to end
 
+            # Track the working sample rate (may be resampled)
+            working_sample_rate = None
+
             try:
                 async for resp in audio_stream:
                     if self.state.audio_stop_event.is_set():
                         self.logger.debug("stop event set")
                         break
                     sample_rate = resp.audio.audio_info.sample_rate_hz
+                    audio_data = resp.audio.audio_data
 
                     # WebRTC VAD only supports specific sample rates
                     if sample_rate not in [8000, 16000, 32000, 48000]:
-                        self.logger.error(f"ERROR: Invalid sample rate {sample_rate} Hz for WebRTC VAD. Supported rates: 8000, 16000, 32000, 48000 Hz")
-                        continue
+                        # Choose the nearest supported rate
+                        if sample_rate < 12000:
+                            target_rate = 16000
+                        elif sample_rate < 24000:
+                            target_rate = 16000
+                        elif sample_rate < 40000:
+                            target_rate = 32000
+                        else:
+                            target_rate = 48000
 
-                    buffer.extend(resp.audio.audio_data)
+                        self.logger.warning(f"Resampling audio from {sample_rate} Hz to {target_rate} Hz for WebRTC VAD")
+                        audio_data = self.resample_audio(audio_data, sample_rate, target_rate)
+                        sample_rate = target_rate
+
+                    # Set working rate if not set
+                    if working_sample_rate is None:
+                        working_sample_rate = sample_rate
+
+                    buffer.extend(audio_data)
                     frame_size = int(sample_rate * frame_duration / 1000) * 2  # bytes
 
                     # Process frames of fixed size
@@ -105,7 +150,7 @@ class MicrophoneListener:
                                     if not self.owner.stt_in_progress:
                                         self.owner.stt_in_progress = True
                                         # End of speech - run callback in executor to avoid blocking
-                                        audio_data = sr.AudioData(bytes(speech_buffer), sample_rate, 2)
+                                        audio_data = sr.AudioData(bytes(speech_buffer), working_sample_rate, 2)
 
                                         # Wrap callback to ensure flag is reset on error
                                         def safe_callback():
