@@ -131,6 +131,7 @@ class SpeechIOService(SpeechService, EasyResource):
     microphone_listener: Optional[MicrophoneListener] = None
     stt_in_progress: bool = False
     listen_closer: Optional[Closer] = None
+    is_playing_audio: bool
 
     @classmethod
     def new(
@@ -200,60 +201,58 @@ class SpeechIOService(SpeechService, EasyResource):
                     audio_bytes = BytesIO()
                     sp.write_to_fp(audio_bytes)
 
-                if self.speaker_client is not None:
-                    if not cache_only:
-                        audio_data = audio_bytes.getvalue()
+            if self.speaker_client is not None:
+                if not cache_only:
+                    audio_data = audio_bytes.getvalue()
 
-                        try:
-                            # Load MP3 audio data to get duration and audio properties
-                            audio_segment = AudioSegment.from_file(BytesIO(audio_data), format="mp3")
-                            duration_seconds = len(audio_segment) / 1000.0  # Convert ms to seconds
-
-                            audio_info = AudioInfo(
-                                codec="mp3",
-                                sample_rate_hz=audio_segment.frame_rate,
-                                num_channels=audio_segment.channels
-                            )
-
-
-                            self.logger.debug("playing audio...")
-                            self.is_playing_audio = True
-                            await self.speaker_client.play(
-                                audio_data,
-                                audio_info
-                            )
-                            self.logger.debug("called play...")
-                            if blocking:
-                                await asyncio.sleep(duration_seconds)
-                                self.is_playing_audio = False
-                            else:
-                                # If not blocking, schedule state reset after duration
-                                asyncio.create_task(self._reset_playing_state(duration_seconds))
-
-                        except Exception as e:
-                            self.logger.error(f"speaker client play error: {e}")
-                else:
-                    # Fallback to legacy pygame mixer if no audioout client
-                    if not cache_only:
-                        mixer.music.load(file)
-                        rec_state.playback_stop_requested = (
-                            False  # Reset stop flag for new playback
+                    try:
+                        # Load MP3 audio data to get audio properties
+                        audio_info = AudioInfo(
+                            codec="mp3"
                         )
-                        self.logger.debug("Playing audio...")
-                        mixer.music.play()  # Play it
 
-                    if blocking:
-                        while (
-                            mixer.music.get_busy() and not rec_state.playback_stop_requested
-                        ):
-                            pygame.time.Clock().tick(10)
+                        self.logger.debug("playing audio...")
+                        self.is_playing_audio = True
 
-                    # Reset stop flag after breaking out of loop
-                    if rec_state.playback_stop_requested:
-                        rec_state.playback_stop_requested = False
-                        self.logger.debug(
-                            "say() blocking loop interrupted by stop request"
-                        )
+                        if blocking:
+                            # Wait for playback to complete
+                            await self.speaker_client.play(audio_data, audio_info)
+                            self.logger.debug("playback complete")
+                            self.is_playing_audio = False
+                        else:
+                            # Start playback and return immediately
+                            async def play_and_cleanup():
+                                try:
+                                    await self.speaker_client.play(audio_data, audio_info)
+                                finally:
+                                    self.is_playing_audio = False
+
+                            asyncio.create_task(play_and_cleanup())
+
+                    except Exception as e:
+                        self.logger.error(f"speaker client play error: {e}")
+            else:
+                # Fallback to legacy pygame mixer if no audioout client
+                if not cache_only:
+                    mixer.music.load(file)
+                    rec_state.playback_stop_requested = (
+                        False  # Reset stop flag for new playback
+                    )
+                    self.logger.debug("Playing audio...")
+                    mixer.music.play()  # Play it
+
+                if blocking:
+                    while (
+                        mixer.music.get_busy() and not rec_state.playback_stop_requested
+                    ):
+                        pygame.time.Clock().tick(10)
+
+                # Reset stop flag after breaking out of loop
+                if rec_state.playback_stop_requested:
+                    rec_state.playback_stop_requested = False
+                    self.logger.debug(
+                        "say() blocking loop interrupted by stop request"
+                    )
 
         except RuntimeError as err:
                 self.logger.error(err)
