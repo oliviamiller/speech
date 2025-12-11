@@ -46,23 +46,14 @@ class ViamAudioInSource:
 
     def open(self) -> None:
         """Open the audio source for reading."""
-        if self.logger:
-            self.logger.debug("ViamAudioInSource.open() called")
-
         try:
-            loop = asyncio.get_running_loop()
-            if self.logger:
-                self.logger.debug(f"Found running event loop in open()")
+            asyncio.get_running_loop()
         except RuntimeError:
-            if self.logger:
-                self.logger.error("No running event loop in open() - cannot create task!")
             raise RuntimeError("ViamAudioInSource.open() requires a running event loop")
 
         self._stop_event = asyncio.Event()
         # Start async streaming in background
-        task = asyncio.create_task(self._start_stream())
-        if self.logger:
-            self.logger.debug(f"Created async task: {task}")
+        asyncio.create_task(self._start_stream())
 
     def close(self) -> None:
         """Close the audio source and release resources."""
@@ -79,10 +70,8 @@ class ViamAudioInSource:
             self._audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
             # Start the streaming task
             asyncio.create_task(self._stream_audio())
-            if self.logger:
-                self.logger.debug("Viam audio stream started")
+            self.logger.debug("Viam audio stream started")
         except Exception as e:
-            if self.logger:
                 self.logger.error(f"Failed to start Viam audio stream: {e}")
 
     def read(self, num_samples: int) -> bytes:
@@ -136,9 +125,6 @@ class ViamAudioInSource:
 
                 audio_data = resp.audio.audio_data
                 chunk_count += 1
-
-                if self.logger and chunk_count % 50 == 0:  # Log every 50 chunks
-                    self.logger.debug(f"Received {chunk_count} audio chunks, queue size: {self._queue.qsize()}")
 
                 # Put audio in queue with backpressure
                 try:

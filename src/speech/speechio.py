@@ -396,14 +396,17 @@ class SpeechIOService(SpeechService, EasyResource):
         if self.microphone_client is not None:
             self.logger.debug("listening for speech...")
             # Create listener on-demand if not already set up
+            temp_listener = False
+            listener_closer = None
             if not self.listener:
+                temp_listener = True  # Mark this as temporary
                 self.logger.debug("creating hearken listener for one-off listen()")
                 viam_source = ViamAudioInSource(
                     microphone_client=self.microphone_client,
                     sample_rate=self.listen_sample_rate,
                     logger=self.logger
                 )
-                self._setup_hearken_listener(viam_source, "microphone_client")
+                listener_closer = self._setup_hearken_listener(viam_source, "microphone_client")
 
                 # Give the audio stream a moment to start
                 self.logger.debug("Waiting for audio stream to initialize...")
@@ -419,71 +422,21 @@ class SpeechIOService(SpeechService, EasyResource):
             )
             self.logger.debug(f"wait_for_speech returned: {segment}")
 
+            # Clean up temporary listener
+            if temp_listener and listener_closer:
+                self.logger.debug("Stopping temporary listener and closing audio source")
+                listener_closer()  # Stops listener and closes audio stream
+
             if segment:
                 audio = sr.AudioData(
                     segment.audio_data, segment.sample_rate, segment.sample_width
                 )
                 return await self.convert_audio_to_text(audio)
-            else:
-                self.logger.debug("fallback to manual")
-                # Fallback to manual silence detection if hearken not available
-                audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
-                buffer = bytearray()
 
-                # dB threshold for silence - a lower number = less silence will be detected. speech is -30 to -40 db.
-                # for noisy environments, adjust closer to zero
-                silence_threshold = -40
-                min_silence_len = 1000 #ms
-                should_stop = False
-                async for resp in audio_stream:
-                    buffer.extend(resp.audio.audio_data)
-                    sample_rate = resp.audio.audio_info.sample_rate_hz
-                    num_channels = resp.audio.audio_info.num_channels
-                    sample_width = 2    # 2 bytes for 16-bit
-
-                    audio_segment = AudioSegment(
-                        data=buffer,
-                        sample_width=sample_width,
-                        frame_rate=sample_rate,
-                        channels=num_channels
-                    )
-
-                    # Check if we have enough audio to analyze (at least 3 seconds)
-                    if len(audio_segment) >= 3000:
-                          # Detect silence in the last portion
-                          recent_audio = audio_segment[-3000:]
-                          silence_ranges = silence.detect_silence(
-                              recent_audio,
-                              min_silence_len=min_silence_len,
-                              silence_thresh=silence_threshold
-                          )
-
-                        # If recent audio is mostly silence, stop recording
-                          if silence_ranges:
-                              # Check if there's a silience period that's long enough
-                              for silence_start, silence_end in silence_ranges:
-                                  silence_duration = silence_end - silence_start
-                                  if silence_duration >= min_silence_len:
-                                      self.logger.debug("Silence detected, stopping recording")
-                                      should_stop = True
-                                      break
-                    if should_stop:
-                        break
-                if buffer:
-                  audio_data = sr.AudioData(bytes(buffer), sample_rate, sample_width)
-                  return await self.convert_audio_to_text(audio_data)
-                return ""
-
-        #Use legacy SR library
+        #Use legacy SR microphone
         elif rec_state.rec is not None and rec_state.mic is not None:
             if self.use_new_listener:
-                # Run wait_for_speech in executor to avoid blocking event loop
-                loop = asyncio.get_event_loop()
-                segment = await loop.run_in_executor(
-                    None,
-                    lambda: self.listener.wait_for_speech(timeout=30.0)
-                )
-
+                segment = self.listener.wait_for_speech()
                 if segment:
                     audio = sr.AudioData(
                         segment.audio_data, segment.sample_rate, segment.sample_width
