@@ -957,8 +957,8 @@ class SpeechIOService(SpeechService, EasyResource):
 
         def listener_closer(wait_for_stop=True):
             self.listener.stop()
-            if hasattr(source, 'stop'):
-                source.stop()
+            if hasattr(source, 'close'):
+                source.close()
 
         self.listener.start()
         return listener_closer

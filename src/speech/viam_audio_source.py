@@ -20,6 +20,7 @@ class ViamAudioInSource:
         self,
         microphone_client: AudioIn,
         sample_rate: int = 16000,
+        sample_width: int = 2,  # 2 bytes for 16-bit PCM
         chunk_size: int = 1024,
         logger=None
     ):
@@ -27,11 +28,13 @@ class ViamAudioInSource:
         Args:
             microphone_client: Viam AudioIn component
             sample_rate: Target sample rate in Hz
+            sample_width: Bytes per sample (2 for 16-bit PCM)
             chunk_size: Size of audio chunks in samples
             logger: Optional logger instance
         """
         self.microphone_client = microphone_client
-        self.sample_rate = sample_rate
+        self._sample_rate = sample_rate
+        self._sample_width = sample_width
         self.chunk_size = chunk_size
         self.logger = logger
 
@@ -40,8 +43,8 @@ class ViamAudioInSource:
         self._buffer = bytearray()
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
-    def start(self):
-        """Start the audio stream."""
+    def open(self) -> None:
+        """Open the audio source for reading."""
         try:
             self._loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -54,6 +57,22 @@ class ViamAudioInSource:
         # Start async streaming in background
         asyncio.create_task(self._start_stream())
 
+    def close(self) -> None:
+        """Close the audio source and release resources."""
+        if self._stop_event:
+            self._stop_event.set()
+
+        if self._audio_stream and self._loop:
+            # Close the stream asynchronously
+            async def close_stream():
+                try:
+                    await self._audio_stream.aclose()
+                except Exception as e:
+                    if self.logger:
+                        self.logger.error(f"Error closing audio stream: {e}")
+
+            asyncio.run_coroutine_threadsafe(close_stream(), self._loop)
+
     async def _start_stream(self):
         """Internal method to start streaming audio from Viam component."""
         try:
@@ -62,20 +81,19 @@ class ViamAudioInSource:
             if self.logger:
                 self.logger.error(f"Failed to start Viam audio stream: {e}")
 
-    def read(self, chunk_size: Optional[int] = None) -> Optional[bytes]:
-        """Read audio chunk synchronously.
+    def read(self, num_samples: int) -> bytes:
+        """Read audio samples from the source.
 
         Args:
-            chunk_size: Number of bytes to read (uses default if None)
+            num_samples: Number of samples to read
 
         Returns:
-            Audio data as bytes, or None if stream ended
+            Audio data as bytes
         """
-        if chunk_size is None:
-            chunk_size = self.chunk_size * 2  # 2 bytes per sample for pcm16
+        chunk_size = num_samples * self._sample_width
 
         if self._loop is None or self._audio_stream is None:
-            return None
+            return b''
 
         # Run async read in the event loop
         try:
@@ -83,11 +101,12 @@ class ViamAudioInSource:
                 self._read_async(chunk_size),
                 self._loop
             )
-            return future.result(timeout=1.0)
+            result = future.result(timeout=1.0)
+            return result if result is not None else b''
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Error reading from Viam audio source: {e}")
-            return None
+            return b''
 
     async def _read_async(self, chunk_size: int) -> Optional[bytes]:
         """Internal async method to read from audio stream."""
@@ -128,37 +147,21 @@ class ViamAudioInSource:
         else:
             return None
 
-    def stop(self):
-        """Stop the audio stream."""
-        if self._stop_event:
-            self._stop_event.set()
-
-        if self._audio_stream and self._loop:
-            # Close the stream asynchronously
-            async def close():
-                try:
-                    await self._audio_stream.aclose()
-                except Exception as e:
-                    if self.logger:
-                        self.logger.error(f"Error closing audio stream: {e}")
-
-            asyncio.run_coroutine_threadsafe(close(), self._loop)
+    @property
+    def sample_rate(self) -> int:
+        """Sample rate in Hz (e.g., 16000)."""
+        return self._sample_rate
 
     @property
-    def SAMPLE_RATE(self) -> int:
-        """Sample rate property expected by hearken."""
-        return self.sample_rate
-
-    @property
-    def CHUNK(self) -> int:
-        """Chunk size property expected by hearken."""
-        return self.chunk_size
+    def sample_width(self) -> int:
+        """Bytes per sample (e.g., 2 for 16-bit)."""
+        return self._sample_width
 
     def __enter__(self):
         """Context manager entry."""
-        self.start()
+        self.open()
         return self
 
     def __exit__(self, exc_type, exc_val, exc_tb):
         """Context manager exit."""
-        self.stop()
+        self.close()
