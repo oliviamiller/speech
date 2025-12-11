@@ -77,9 +77,13 @@ class ViamAudioInSource:
     async def _start_stream(self):
         """Internal method to start streaming audio from Viam component."""
         try:
+            if self.logger:
+                self.logger.debug("Starting Viam audio stream...")
             self._audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
             # Start the streaming task
             asyncio.create_task(self._stream_audio())
+            if self.logger:
+                self.logger.debug("Viam audio stream started")
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Failed to start Viam audio stream: {e}")
@@ -127,12 +131,17 @@ class ViamAudioInSource:
 
     async def _stream_audio(self):
         """Continuously stream audio from Viam into the queue."""
+        chunk_count = 0
         try:
             async for resp in self._audio_stream:
                 if self._stop_event and self._stop_event.is_set():
                     break
 
                 audio_data = resp.audio.audio_data
+                chunk_count += 1
+
+                if self.logger and chunk_count % 50 == 0:  # Log every 50 chunks
+                    self.logger.debug(f"Received {chunk_count} audio chunks, queue size: {self._queue.qsize()}")
 
                 # Put audio in queue with backpressure
                 try:
@@ -148,6 +157,9 @@ class ViamAudioInSource:
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Error in audio streaming: {e}")
+        finally:
+            if self.logger:
+                self.logger.debug(f"Audio streaming ended. Total chunks: {chunk_count}")
 
     @property
     def sample_rate(self) -> int:

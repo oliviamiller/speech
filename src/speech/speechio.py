@@ -407,8 +407,10 @@ class SpeechIOService(SpeechService, EasyResource):
                 self._setup_hearken_listener(viam_source, "microphone_client")
 
             # Run wait_for_speech in executor to avoid blocking event loop
+            self.logger.debug("Waiting for speech detection...")
             loop = asyncio.get_event_loop()
-            segment = await loop.run_in_executor(None, self.listener.wait_for_speech)
+            segment = await loop.run_in_executor(None, self.listener.wait_tfor_speech)
+            self.logger.debug(f"wait_for_speech returned: {segment}")
 
             if segment:
                 audio = sr.AudioData(
