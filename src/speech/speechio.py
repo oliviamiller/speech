@@ -395,7 +395,8 @@ class SpeechIOService(SpeechService, EasyResource):
         if self.microphone_client is not None:
             self.logger.debug("listening for speech...")
             # Create listener on-demand if not already set up
-            if not hasattr(self, 'listener') or not self.listener:
+            if not self.listener:
+                self.logger.debug("creating hearken listener")
                 viam_source = ViamAudioInSource(
                     microphone_client=self.microphone_client,
                     sample_rate=self.listen_sample_rate,
