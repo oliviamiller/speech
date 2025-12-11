@@ -6,6 +6,7 @@ Allows hearken to use Viam's AudioIn component as an audio source.
 
 import asyncio
 from typing import Optional
+from queue import Queue, Full
 from viam.components.audio_in import AudioIn
 
 
@@ -40,7 +41,8 @@ class ViamAudioInSource:
 
         self._audio_stream = None
         self._stop_event: Optional[asyncio.Event] = None
-        self._buffer = bytearray()
+        # Use a queue with limited size to prevent unbounded memory growth
+        self._queue: Queue = Queue(maxsize=50)  # ~50 chunks buffer
         self._loop: Optional[asyncio.AbstractEventLoop] = None
 
     def open(self) -> None:
@@ -77,6 +79,8 @@ class ViamAudioInSource:
         """Internal method to start streaming audio from Viam component."""
         try:
             self._audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
+            # Start the streaming task
+            asyncio.create_task(self._stream_audio())
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Failed to start Viam audio stream: {e}")
@@ -91,61 +95,56 @@ class ViamAudioInSource:
             Audio data as bytes
         """
         chunk_size = num_samples * self._sample_width
+        buffer = bytearray()
 
-        if self._loop is None or self._audio_stream is None:
-            return b''
-
-        # Run async read in the event loop
-        try:
-            future = asyncio.run_coroutine_threadsafe(
-                self._read_async(chunk_size),
-                self._loop
-            )
-            result = future.result(timeout=1.0)
-            return result if result is not None else b''
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"Error reading from Viam audio source: {e}")
-            return b''
-
-    async def _read_async(self, chunk_size: int) -> Optional[bytes]:
-        """Internal async method to read from audio stream."""
-        if self._audio_stream is None:
-            return None
-
-        # Fill buffer until we have enough data
-        while len(self._buffer) < chunk_size:
-            if self._stop_event and self._stop_event.is_set():
+        # Read from queue until we have enough data
+        while len(buffer) < chunk_size:
+            try:
+                # Try to get audio chunk from queue with timeout
+                chunk = self._queue.get(timeout=0.1)
+                buffer.extend(chunk)
+            except:
+                # Queue empty or timeout - return what we have
                 break
 
-            try:
-                # Get next audio chunk from stream
-                resp = await self._audio_stream.__anext__()
+        if len(buffer) >= chunk_size:
+            # Return exactly the requested amount
+            result = bytes(buffer[:chunk_size])
+            # Put remaining back in queue if any
+            if len(buffer) > chunk_size:
+                remaining = bytes(buffer[chunk_size:])
+                try:
+                    self._queue.put_nowait(remaining)
+                except Full:
+                    pass  # Drop if queue full
+            return result
+        else:
+            # Return whatever we got
+            return bytes(buffer)
+
+    async def _stream_audio(self):
+        """Continuously stream audio from Viam into the queue."""
+        try:
+            async for resp in self._audio_stream:
+                if self._stop_event and self._stop_event.is_set():
+                    break
+
                 audio_data = resp.audio.audio_data
 
-                # Note: We assume the sample rate matches. For production,
-                # you might want to add resampling here if needed.
-                self._buffer.extend(audio_data)
+                # Put audio in queue with backpressure
+                try:
+                    self._queue.put(audio_data, timeout=0.01)
+                except Full:
+                    # Queue full - drop this chunk (backpressure)
+                    if self.logger:
+                        self.logger.warning("Audio queue full, dropping chunk")
+                    continue
 
-            except StopAsyncIteration:
-                break
-            except Exception as e:
-                if self.logger:
-                    self.logger.error(f"Error reading from audio stream: {e}")
-                break
-
-        # Return requested chunk
-        if len(self._buffer) >= chunk_size:
-            chunk = bytes(self._buffer[:chunk_size])
-            self._buffer = self._buffer[chunk_size:]
-            return chunk
-        elif len(self._buffer) > 0:
-            # Return what we have if stream ended
-            chunk = bytes(self._buffer)
-            self._buffer.clear()
-            return chunk
-        else:
-            return None
+        except asyncio.CancelledError:
+            pass
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Error in audio streaming: {e}")
 
     @property
     def sample_rate(self) -> int:
