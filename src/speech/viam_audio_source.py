@@ -63,17 +63,8 @@ class ViamAudioInSource:
         """Close the audio source and release resources."""
         if self._stop_event:
             self._stop_event.set()
-
-        if self._audio_stream and self._loop:
-            # Close the stream asynchronously
-            async def close_stream():
-                try:
-                    await self._audio_stream.close()
-                except Exception as e:
-                    if self.logger:
-                        self.logger.error(f"Error closing audio stream: {e}")
-
-            asyncio.run_coroutine_threadsafe(close_stream(), self._loop)
+        # The audio stream is an async iterator that will clean up when the task ends
+        self._audio_stream = None
 
     async def _start_stream(self):
         """Internal method to start streaming audio from Viam component."""
