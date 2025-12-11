@@ -65,7 +65,9 @@ class ViamAudioInSource:
         asyncio.run_coroutine_threadsafe(create_event(), self._loop).result()
 
         # Start async streaming in background using the loop
-        asyncio.run_coroutine_threadsafe(self._start_stream(), self._loop)
+        # Wait for stream to actually start (with timeout)
+        future = asyncio.run_coroutine_threadsafe(self._start_stream(), self._loop)
+        future.result(timeout=5.0)  # Wait up to 5 seconds for stream to start
 
     def close(self) -> None:
         """Close the audio source and release resources."""
