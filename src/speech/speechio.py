@@ -131,6 +131,7 @@ class SpeechIOService(SpeechService, EasyResource):
     stt_in_progress: bool = False
     listen_closer: Optional[Closer] = None
     is_playing_audio: bool
+    listener: Optional[Listener] = None
 
     @classmethod
     def new(
