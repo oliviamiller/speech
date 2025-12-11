@@ -407,9 +407,13 @@ class SpeechIOService(SpeechService, EasyResource):
                 self._setup_hearken_listener(viam_source, "microphone_client")
 
             # Run wait_for_speech in executor to avoid blocking event loop
-            self.logger.debug("Waiting for speech detection...")
+            self.logger.debug("Waiting for speech detection (30s timeout)...")
             loop = asyncio.get_event_loop()
-            segment = await loop.run_in_executor(None, self.listener.wait_tfor_speech)
+            # Add a 30 second timeout
+            segment = await loop.run_in_executor(
+                None,
+                lambda: self.listener.wait_for_speech(timeout=30.0)
+            )
             self.logger.debug(f"wait_for_speech returned: {segment}")
 
             if segment:
@@ -472,7 +476,10 @@ class SpeechIOService(SpeechService, EasyResource):
             if self.use_new_listener:
                 # Run wait_for_speech in executor to avoid blocking event loop
                 loop = asyncio.get_event_loop()
-                segment = await loop.run_in_executor(None, self.listener.wait_for_speech)
+                segment = await loop.run_in_executor(
+                    None,
+                    lambda: self.listener.wait_for_speech(timeout=30.0)
+                )
 
                 if segment:
                     audio = sr.AudioData(
