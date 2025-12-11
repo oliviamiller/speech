@@ -68,7 +68,7 @@ class ViamAudioInSource:
             # Close the stream asynchronously
             async def close_stream():
                 try:
-                    await self._audio_stream.aclose()
+                    await self._audio_stream.close()
                 except Exception as e:
                     if self.logger:
                         self.logger.error(f"Error closing audio stream: {e}")
@@ -107,6 +107,7 @@ class ViamAudioInSource:
                 # Queue empty or timeout - return what we have
                 break
 
+        # Always return exactly the requested size
         if len(buffer) >= chunk_size:
             # Return exactly the requested amount
             result = bytes(buffer[:chunk_size])
@@ -116,11 +117,14 @@ class ViamAudioInSource:
                 try:
                     self._queue.put_nowait(remaining)
                 except Full:
-                    pass  # Drop if queue full
+                    if self.logger:
+                        self.logger.warning("Failed to return excess audio to queue")
             return result
-        else:
-            # Return whatever we got
-            return bytes(buffer)
+
+        # Pad with silence (zeros) to match requested size if we don't have enough data
+        silence_needed = chunk_size - len(buffer)
+        buffer.extend(b'\x00' * silence_needed)
+        return bytes(buffer)
 
     async def _stream_audio(self):
         """Continuously stream audio from Viam into the queue."""

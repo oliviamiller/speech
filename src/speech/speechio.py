@@ -215,11 +215,14 @@ class SpeechIOService(SpeechService, EasyResource):
                                 num_channels=audio_segment.channels
                             )
 
+
+                            self.logger.debug("playing audio...")
                             self.is_playing_audio = True
                             await self.speaker_client.play(
                                 audio_data,
                                 audio_info
                             )
+                            self.logger.debug("called play...")
                             if blocking:
                                 await asyncio.sleep(duration_seconds)
                                 self.is_playing_audio = False
