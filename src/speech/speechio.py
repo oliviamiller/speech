@@ -993,7 +993,13 @@ class SpeechIOService(SpeechService, EasyResource):
             if hasattr(source, 'close'):
                 source.close()
 
-        self.listener.start()
+        try:
+            self.logger.debug("Starting hearken listener...")
+            self.listener.start()
+            self.logger.debug("Hearken listener started successfully")
+        except Exception as e:
+            self.logger.error(f"Failed to start hearken listener: {e}")
+            raise
         return listener_closer
 
     def _setup_background_listening(self):

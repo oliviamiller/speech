@@ -46,9 +46,23 @@ class ViamAudioInSource:
 
     def open(self) -> None:
         """Open the audio source for reading."""
+        if self.logger:
+            self.logger.debug("ViamAudioInSource.open() called")
+
+        try:
+            loop = asyncio.get_running_loop()
+            if self.logger:
+                self.logger.debug(f"Found running event loop in open()")
+        except RuntimeError:
+            if self.logger:
+                self.logger.error("No running event loop in open() - cannot create task!")
+            raise RuntimeError("ViamAudioInSource.open() requires a running event loop")
+
         self._stop_event = asyncio.Event()
         # Start async streaming in background
-        asyncio.create_task(self._start_stream())
+        task = asyncio.create_task(self._start_stream())
+        if self.logger:
+            self.logger.debug(f"Created async task: {task}")
 
     def close(self) -> None:
         """Close the audio source and release resources."""
