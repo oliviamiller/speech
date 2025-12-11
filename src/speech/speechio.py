@@ -404,9 +404,13 @@ class SpeechIOService(SpeechService, EasyResource):
                     logger=self.logger,
                     loop=self.main_loop
                 )
-                self._setup_hearken_listener(viam_source, "microphone_client", start_background=False)
+                self._setup_hearken_listener(viam_source, "microphone_client")
 
-            if segment := self.listener.wait_for_speech():
+            # Run wait_for_speech in executor to avoid blocking event loop
+            loop = asyncio.get_event_loop()
+            segment = await loop.run_in_executor(None, self.listener.wait_for_speech)
+
+            if segment:
                 audio = sr.AudioData(
                     segment.audio_data, segment.sample_rate, segment.sample_width
                 )
@@ -464,7 +468,11 @@ class SpeechIOService(SpeechService, EasyResource):
         #Use legacy SR library
         elif rec_state.rec is not None and rec_state.mic is not None:
             if self.use_new_listener:
-                if segment := self.listener.wait_for_speech():
+                # Run wait_for_speech in executor to avoid blocking event loop
+                loop = asyncio.get_event_loop()
+                segment = await loop.run_in_executor(None, self.listener.wait_for_speech)
+
+                if segment:
                     audio = sr.AudioData(
                         segment.audio_data, segment.sample_rate, segment.sample_width
                     )
@@ -931,13 +939,12 @@ class SpeechIOService(SpeechService, EasyResource):
             if self.listen_closer is not None:
                 self.listen_closer()
 
-    def _setup_hearken_listener(self, source, source_name: str, start_background: bool = True):
+    def _setup_hearken_listener(self, source, source_name: str):
         """Set up hearken Listener with configurable VAD.
 
         Args:
             source: Audio source (ViamAudioInSource or SpeechRecognitionSource)
             source_name: Name for logging (e.g., "microphone_client" or "speech_recognition")
-            start_background: Whether to start background listening (False for one-off listen() calls)
 
         Returns:
             Closer function to stop the listener
@@ -970,13 +977,11 @@ class SpeechIOService(SpeechService, EasyResource):
         )
 
         def listener_closer(wait_for_stop=True):
-            if start_background:
-                self.listener.stop()
+            self.listener.stop()
             if hasattr(source, 'close'):
                 source.close()
 
-        if start_background:
-            self.listener.start()
+        self.listener.start()
         return listener_closer
 
     def _setup_background_listening(self):
