@@ -397,14 +397,14 @@ class SpeechIOService(SpeechService, EasyResource):
             self.logger.debug("listening for speech...")
             # Create listener on-demand if not already set up
             if not self.listener:
-                self.logger.debug("creating hearken listener")
+                self.logger.debug("creating hearken listener for one-off listen()")
                 viam_source = ViamAudioInSource(
                     microphone_client=self.microphone_client,
                     sample_rate=self.listen_sample_rate,
                     logger=self.logger,
                     loop=self.main_loop
                 )
-                self._setup_hearken_listener(viam_source, "microphone_client")
+                self._setup_hearken_listener(viam_source, "microphone_client", start_background=False)
 
             if segment := self.listener.wait_for_speech():
                 audio = sr.AudioData(
@@ -931,12 +931,13 @@ class SpeechIOService(SpeechService, EasyResource):
             if self.listen_closer is not None:
                 self.listen_closer()
 
-    def _setup_hearken_listener(self, source, source_name: str):
+    def _setup_hearken_listener(self, source, source_name: str, start_background: bool = True):
         """Set up hearken Listener with configurable VAD.
 
         Args:
             source: Audio source (ViamAudioInSource or SpeechRecognitionSource)
             source_name: Name for logging (e.g., "microphone_client" or "speech_recognition")
+            start_background: Whether to start background listening (False for one-off listen() calls)
 
         Returns:
             Closer function to stop the listener
@@ -969,11 +970,13 @@ class SpeechIOService(SpeechService, EasyResource):
         )
 
         def listener_closer(wait_for_stop=True):
-            self.listener.stop()
+            if start_background:
+                self.listener.stop()
             if hasattr(source, 'close'):
                 source.close()
 
-        self.listener.start()
+        if start_background:
+            self.listener.start()
         return listener_closer
 
     def _setup_background_listening(self):
