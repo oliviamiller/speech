@@ -401,8 +401,7 @@ class SpeechIOService(SpeechService, EasyResource):
                 viam_source = ViamAudioInSource(
                     microphone_client=self.microphone_client,
                     sample_rate=self.listen_sample_rate,
-                    logger=self.logger,
-                    loop=self.main_loop
+                    logger=self.logger
                 )
                 self._setup_hearken_listener(viam_source, "microphone_client")
 
@@ -1018,8 +1017,7 @@ class SpeechIOService(SpeechService, EasyResource):
             viam_source = ViamAudioInSource(
                 microphone_client=self.microphone_client,
                 sample_rate=self.listen_sample_rate,
-                logger=self.logger,
-                loop=self.main_loop
+                logger=self.logger
             )
             self.listen_closer = self._setup_hearken_listener(viam_source, "microphone_client")
 

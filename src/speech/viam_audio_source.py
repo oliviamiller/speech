@@ -23,8 +23,7 @@ class ViamAudioInSource:
         sample_rate: int = 16000,
         sample_width: int = 2,  # 2 bytes for 16-bit PCM
         chunk_size: int = 1024,
-        logger=None,
-        loop: Optional[asyncio.AbstractEventLoop] = None
+        logger=None
     ):
         """
         Args:
@@ -33,7 +32,6 @@ class ViamAudioInSource:
             sample_width: Bytes per sample (2 for 16-bit PCM)
             chunk_size: Size of audio chunks in samples
             logger: Optional logger instance
-            loop: Event loop to use for async operations
         """
         self.microphone_client = microphone_client
         self._sample_rate = sample_rate
@@ -45,28 +43,12 @@ class ViamAudioInSource:
         self._stop_event: Optional[asyncio.Event] = None
         # Use a queue with limited size to prevent unbounded memory growth
         self._queue: Queue = Queue(maxsize=50)  # ~50 chunks buffer
-        self._loop: Optional[asyncio.AbstractEventLoop] = loop
 
     def open(self) -> None:
         """Open the audio source for reading."""
-        if self._loop is None:
-            try:
-                self._loop = asyncio.get_running_loop()
-            except RuntimeError:
-                raise RuntimeError(
-                    "ViamAudioInSource requires an event loop. "
-                    "Pass loop parameter to __init__ or call from async context."
-                )
-
-        # Create stop event in the loop's context
-        async def create_event():
-            self._stop_event = asyncio.Event()
-
-        asyncio.run_coroutine_threadsafe(create_event(), self._loop).result()
-
-        # Start async streaming in background using the loop
-        asyncio.run_coroutine_threadsafe(self._start_stream(), self._loop)
-        # Note: Don't wait with .result() - it can cause deadlock if called from event loop thread
+        self._stop_event = asyncio.Event()
+        # Start async streaming in background
+        asyncio.create_task(self._start_stream())
 
     def close(self) -> None:
         """Close the audio source and release resources."""
