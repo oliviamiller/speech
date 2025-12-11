@@ -361,7 +361,16 @@ class SpeechIOService(SpeechService, EasyResource):
                                         rec_state.stt_in_progress = True
                                         # End of speech - run callback in executor to avoid blocking
                                         audio_data = sr.AudioData(bytes(speech_buffer), sample_rate, 2)
-                                        asyncio.get_event_loop().run_in_executor(None, callback, rec_state.rec, audio_data)
+
+                                        # Wrap callback to ensure flag is reset on error
+                                        def safe_callback():
+                                            try:
+                                                callback(rec_state.rec, audio_data)
+                                            except Exception as e:
+                                                self.logger.error(f"STT callback error: {e}")
+                                                rec_state.stt_in_progress = False
+
+                                        asyncio.get_event_loop().run_in_executor(None, safe_callback)
                                     else:
                                         self.logger.debug("STT already in progress, skipping this audio")
                                     speech_buffer.clear()
@@ -526,7 +535,7 @@ class SpeechIOService(SpeechService, EasyResource):
                           silence_thresh=silence_threshold
                       )
                       # Calculate min dBFS manually
-                      audio_array = numpy.array(recent_audio.get_array_of_samples())
+                      audio_array = np.array(recent_audio.get_array_of_samples())
                     #   min_sample = numpy.min(numpy.abs(audio_array))
                     #   print(f"Audio segment length: {len(recent_audio)}ms, Max dBFS: {recent_audio.max_dBFS:.1f}, average dBFS: {recent_audio.dBFS:.1f}")
                     #   print(f"Silence threshold: {silence_threshold} dB, Min silence len: {min_silence_len} ms")
@@ -754,7 +763,7 @@ class SpeechIOService(SpeechService, EasyResource):
             if p:
                 p.terminate()
 
-    def vosk_vad_listen_in_background(self, callback):
+    def vosk_vad_listen_in_background(self):
         """VOSK VAD thread for microphone_client (AudioIn component)"""
         self.logger.debug("Vosk VAD: listening in background")
         rec_state.vosk_stop_event = asyncio.Event()
@@ -856,17 +865,20 @@ class SpeechIOService(SpeechService, EasyResource):
 
             rec_state.vosk_model = vosk.Model(model_path)
             rec_state.vosk_rec = vosk.KaldiRecognizer(rec_state.vosk_model, 16000)
-            rec_state.vosk_stop_event = threading.Event()
 
-            rec_state.vosk_thread = threading.Thread(
-                target=self.vosk_vad_thread, daemon=True
-                )
             if self.microphone_client is not None:
-                self.vosk_vad_listen_in_background()
+                # Use async version for microphone_client
+                rec_state.vosk_closer = self.vosk_vad_listen_in_background()
+                self.logger.debug("Started Vosk VAD for voice activity detection (microphone_client)")
             else:
+                # Use threaded version for PyAudio
+                rec_state.vosk_stop_event = threading.Event()
+                rec_state.vosk_thread = threading.Thread(
+                    target=self.vosk_vad_thread, daemon=True
+                )
                 rec_state.vosk_thread.start()
+                self.logger.debug("Started Vosk VAD for voice activity detection (PyAudio)")
 
-            self.logger.debug("Started Vosk VAD for voice activity detection")
             return True
 
         except Exception as e:
@@ -1344,10 +1356,21 @@ class SpeechIOService(SpeechService, EasyResource):
                 rec_state.listen_closer(True)
             self.stop_vosk_vad()
 
-            # Use viam microphone component first if availiable.
+            # Use viam microphone component first if available.
             if self.microphone_client is not None and not self.disable_mic:
                 self.logger.debug("Using audio_in component for microphone input")
-                rec_state.listen_closer = self.audio_listen_in_background(self.listen_callback)
+
+                # Try Vosk VAD first if enabled
+                if self.use_vosk_vad:
+                    if self.start_vosk_vad():
+                        self.logger.debug("Using Vosk VAD with microphone_client")
+                    else:
+                        # Fallback to WebRTC VAD
+                        self.logger.debug("Vosk VAD initialization failed, falling back to WebRTC VAD")
+                        rec_state.listen_closer = self.audio_listen_in_background(self.listen_callback)
+                else:
+                    # Use WebRTC VAD by default
+                    rec_state.listen_closer = self.audio_listen_in_background(self.listen_callback)
             elif not self.disable_mic:
 
                 # Set up speech recognition
