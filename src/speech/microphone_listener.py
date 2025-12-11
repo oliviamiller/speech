@@ -25,7 +25,6 @@ class MicrophoneListener:
         logger,
         microphone_client,
         callback: Callable,
-        recognizer,
         owner
     ):
         """
@@ -39,7 +38,6 @@ class MicrophoneListener:
         self.logger = logger
         self.microphone_client = microphone_client
         self.callback = callback
-        self.recognizer = recognizer
         self.owner = owner
         self.state = MicrophoneListenerState()
 
@@ -112,7 +110,7 @@ class MicrophoneListener:
                                         # Wrap callback to ensure flag is reset on error
                                         def safe_callback():
                                             try:
-                                                self.callback(self.recognizer, audio_data)
+                                                self.callback(audio_data)
                                             except Exception as e:
                                                 self.logger.error(f"STT callback error: {e}")
                                                 self.owner.stt_in_progress = False

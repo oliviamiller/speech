@@ -72,8 +72,10 @@ class Closer(Protocol):
     def __call__(self, wait_for_stop: bool = True) -> None: ...
 
 
+
+# Legacy microphone and speech reognition struct,
+# kept for backwards compatibility
 class RecState:
-    listen_closer: Optional[Closer] = None
     mic: Optional[sr.Microphone] = None
     rec: Optional[sr.Recognizer] = None
     # Audio playback interrupt flag
@@ -127,6 +129,7 @@ class SpeechIOService(SpeechService, EasyResource):
     vosk_handler: Optional[VoskHandler] = None
     microphone_listener: Optional[MicrophoneListener] = None
     stt_in_progress: bool = False
+    listen_closer: Optional[Closer] = None
 
     @classmethod
     def new(
@@ -177,61 +180,69 @@ class SpeechIOService(SpeechService, EasyResource):
             + ".mp3",
         )
         try:
-            if self.speech_provider == "elevenlabs":
-                audio = self.eleven_client["client"].text_to_speech.convert(
-                    text=text, **self.speech_generation_config
-                )
-                eleven_save(audio=audio, filename=file)
-            else:
-                sp = gTTS(text=text, **self.speech_generation_config)
-                sp.save(file)
-                audio_bytes = BytesIO()
-                sp.write_to_fp(audio_bytes)
-
-            if self.speaker_client is not None:
-                # Get the actual bytes from BytesIO
-                audio_data = audio_bytes.getvalue()
-
-                try:
-                    # Load MP3 audio data to get duration and audio properties
-                    audio_segment = AudioSegment.from_file(BytesIO(audio_data), format="mp3")
-                    duration_seconds = len(audio_segment) / 1000.0  # Convert ms to seconds
-
-                    audio_info = AudioInfo(
-                        codec="mp3",
-                        sample_rate_hz=audio_segment.frame_rate,
-                        num_channels=audio_segment.channels
+            if not os.path.isfile(file):   # read from cache if it exists
+                if self.speech_provider == "elevenlabs":
+                    audio = self.eleven_client["client"].text_to_speech.convert(
+                        text=text, **self.speech_generation_config
                     )
-
-                    self.is_playing_audio = True
-                    await self.speaker_client.play(
-                        audio_data,
-                        audio_info
-                    )
-                    if blocking:
-                        await asyncio.sleep(duration_seconds)
-                        self.is_playing_audio = False
+                    eleven_save(audio=audio, filename=file)
+                    # Create audio_bytes for speaker_client path
+                    audio_bytes = BytesIO()
+                    if isinstance(audio, Iterator):
+                        for chunk in audio:
+                            audio_bytes.write(chunk)
                     else:
-                        # If not blocking, schedule state reset after duration
-                        asyncio.create_task(self._reset_playing_state(duration_seconds))
+                        audio_bytes.write(audio)
+                else:
+                    sp = gTTS(text=text, **self.speech_generation_config)
+                    sp.save(file)
+                    audio_bytes = BytesIO()
+                    sp.write_to_fp(audio_bytes)
 
-                except Exception as e:
-                    self.logger.error(f"speaker client play error: {e}")
-            else:
-                # Fallback to pygame mixer if no speaker_client
-                if not cache_only:
-                    mixer.music.load(file)
-                    rec_state.playback_stop_requested = (
-                        False  # Reset stop flag for new playback
-                    )
-                    self.logger.debug("Playing audio...")
-                    mixer.music.play()  # Play it
+                if self.speaker_client is not None:
+                    if not cache_only:
+                        audio_data = audio_bytes.getvalue()
 
-                if blocking:
-                    while (
-                        mixer.music.get_busy() and not rec_state.playback_stop_requested
-                    ):
-                        pygame.time.Clock().tick(10)
+                        try:
+                            # Load MP3 audio data to get duration and audio properties
+                            audio_segment = AudioSegment.from_file(BytesIO(audio_data), format="mp3")
+                            duration_seconds = len(audio_segment) / 1000.0  # Convert ms to seconds
+
+                            audio_info = AudioInfo(
+                                codec="mp3",
+                                sample_rate_hz=audio_segment.frame_rate,
+                                num_channels=audio_segment.channels
+                            )
+
+                            self.is_playing_audio = True
+                            await self.speaker_client.play(
+                                audio_data,
+                                audio_info
+                            )
+                            if blocking:
+                                await asyncio.sleep(duration_seconds)
+                                self.is_playing_audio = False
+                            else:
+                                # If not blocking, schedule state reset after duration
+                                asyncio.create_task(self._reset_playing_state(duration_seconds))
+
+                        except Exception as e:
+                            self.logger.error(f"speaker client play error: {e}")
+                else:
+                    # Fallback to legacy pygame mixer if no audioout client
+                    if not cache_only:
+                        mixer.music.load(file)
+                        rec_state.playback_stop_requested = (
+                            False  # Reset stop flag for new playback
+                        )
+                        self.logger.debug("Playing audio...")
+                        mixer.music.play()  # Play it
+
+                    if blocking:
+                        while (
+                            mixer.music.get_busy() and not rec_state.playback_stop_requested
+                        ):
+                            pygame.time.Clock().tick(10)
 
                     # Reset stop flag after breaking out of loop
                     if rec_state.playback_stop_requested:
@@ -241,7 +252,6 @@ class SpeechIOService(SpeechService, EasyResource):
                         )
 
         except RuntimeError as err:
-                self.logger.info("error")
                 self.logger.error(err)
                 raise ValueError("say() speech failure")
 
@@ -256,14 +266,14 @@ class SpeechIOService(SpeechService, EasyResource):
             self.trigger_active = True
             if self.should_listen:
                 # close and re-open listener so any in-progress speech is not captured
-                if rec_state.listen_closer is not None:
-                    rec_state.listen_closer(True)
+                if self.listen_closer is not None:
+                    self.listen_closer(True)
 
-            # Use microphone_client if available, otherwise use pygame microphone
+            # Use microphone_client if available, otherwise use legacy SR microphone
             if self.microphone_client is not None:
-                rec_state.listen_closer = self.audio_listen_in_background(self.listen_callback)
+                self.listen_closer = self.audio_listen_in_background(self.listen_callback)
             elif rec_state.rec is not None and rec_state.mic is not None:
-                rec_state.listen_closer = rec_state.rec.listen_in_background(
+                self.listen_closer = rec_state.rec.listen_in_background(
                     source=rec_state.mic,
                     phrase_time_limit=self.listen_phrase_time_limit,
                     callback=self.listen_callback,
@@ -284,7 +294,7 @@ class SpeechIOService(SpeechService, EasyResource):
         await asyncio.sleep(delay)
         self.is_playing_audio = False
 
-    # Background listening using audio client
+    # Background listening using viam audioin client
     def audio_listen_in_background(self, callback):
         """Start background listening using MicrophoneListener"""
         self.microphone_listener = MicrophoneListener(
@@ -649,7 +659,7 @@ class SpeechIOService(SpeechService, EasyResource):
             self.vosk_handler.stop()
             self.vosk_handler = None
 
-    def listen_callback(self, recognizer, audio):
+    def listen_callback(self, audio):
         """Process audio with optional fuzzy trigger matching."""
         if not self.main_loop or not self.main_loop.is_running():
             self.logger.error("Main event loop is not available for STT task.")
@@ -737,8 +747,8 @@ class SpeechIOService(SpeechService, EasyResource):
             if not self.should_listen:
                 # stop listening if not in background listening mode
                 self.logger.debug("will close background listener")
-                if rec_state.listen_closer is not None:
-                    rec_state.listen_closer()
+                if self.listen_closer is not None:
+                    self.listen_closer()
 
 
     async def convert_audio_to_text(self, audio: sr.AudioData) -> str:
@@ -905,8 +915,8 @@ class SpeechIOService(SpeechService, EasyResource):
             del self.command_list[self.listen_command_buffer_length :]
 
         if not self.should_listen:
-            if rec_state.listen_closer is not None:
-                rec_state.listen_closer()
+            if self.listen_closer is not None:
+                self.listen_closer()
 
     def reconfigure(
         self, config: ComponentConfig, dependencies: Mapping[ResourceName, ResourceBase]
@@ -983,8 +993,8 @@ class SpeechIOService(SpeechService, EasyResource):
         self.listen_sample_rate = int(attrs.get("listen_sample_rate", 48000))
 
         # Stop any existing VAD
-        if rec_state.listen_closer is not None:
-            rec_state.listen_closer(True)
+        if self.listen_closer is not None:
+            self.listen_closer(True)
         self.stop_vosk_vad()
 
         # Validate threshold
@@ -1063,8 +1073,8 @@ class SpeechIOService(SpeechService, EasyResource):
             self.logger.debug("Setting up background listening")
 
             # Stop any existing VAD before setting up new one
-            if rec_state.listen_closer is not None:
-                rec_state.listen_closer(True)
+            if self.listen_closer is not None:
+                self.listen_closer(True)
             self.stop_vosk_vad()
 
             # Use viam microphone component first if available.
@@ -1078,10 +1088,10 @@ class SpeechIOService(SpeechService, EasyResource):
                     else:
                         # Fallback to WebRTC VAD
                         self.logger.debug("Vosk VAD initialization failed, falling back to WebRTC VAD")
-                        rec_state.listen_closer = self.audio_listen_in_background(self.listen_callback)
+                        self.listen_closer = self.audio_listen_in_background(self.listen_callback)
                 else:
                     # Use WebRTC VAD by default
-                    rec_state.listen_closer = self.audio_listen_in_background(self.listen_callback)
+                    self.listen_closer = self.audio_listen_in_background(self.listen_callback)
             elif not self.disable_mic:
 
                 # Set up speech recognition
@@ -1143,12 +1153,12 @@ class SpeechIOService(SpeechService, EasyResource):
                     def pipeline_closer(wait_for_stop=True):
                         self.listener.stop()
 
-                    rec_state.listen_closer = pipeline_closer
+                    self.listen_closer = pipeline_closer
                     self.listener.start()
                 else:
                     # Fall back to speech_recognition VAD
                     self.logger.debug("Using speech_recognition VAD")
-                    rec_state.listen_closer = rec_state.rec.listen_in_background(
+                    self.listen_closer = rec_state.rec.listen_in_background(
                         source=rec_state.mic,
                         phrase_time_limit=self.listen_phrase_time_limit,
                         callback=self.listen_callback,
@@ -1168,8 +1178,8 @@ class SpeechIOService(SpeechService, EasyResource):
         return {"status": "unknown command"}
 
     async def close(self):
-        if rec_state.listen_closer is not None:
-            rec_state.listen_closer(True)
+        if self.listen_closer is not None:
+            self.listen_closer(True)
         self.stop_vosk_vad()
 
 
