@@ -23,7 +23,8 @@ class ViamAudioInSource:
         sample_rate: int = 16000,
         sample_width: int = 2,  # 2 bytes for 16-bit PCM
         chunk_size: int = 1024,
-        logger=None
+        logger=None,
+        loop: Optional[asyncio.AbstractEventLoop] = None
     ):
         """
         Args:
@@ -32,6 +33,7 @@ class ViamAudioInSource:
             sample_width: Bytes per sample (2 for 16-bit PCM)
             chunk_size: Size of audio chunks in samples
             logger: Optional logger instance
+            loop: Event loop to use for async operations
         """
         self.microphone_client = microphone_client
         self._sample_rate = sample_rate
@@ -43,21 +45,27 @@ class ViamAudioInSource:
         self._stop_event: Optional[asyncio.Event] = None
         # Use a queue with limited size to prevent unbounded memory growth
         self._queue: Queue = Queue(maxsize=50)  # ~50 chunks buffer
-        self._loop: Optional[asyncio.AbstractEventLoop] = None
+        self._loop: Optional[asyncio.AbstractEventLoop] = loop
 
     def open(self) -> None:
         """Open the audio source for reading."""
-        try:
-            self._loop = asyncio.get_running_loop()
-        except RuntimeError:
-            # No running loop, create a new one
-            self._loop = asyncio.new_event_loop()
-            asyncio.set_event_loop(self._loop)
+        if self._loop is None:
+            try:
+                self._loop = asyncio.get_running_loop()
+            except RuntimeError:
+                raise RuntimeError(
+                    "ViamAudioInSource requires an event loop. "
+                    "Pass loop parameter to __init__ or call from async context."
+                )
 
-        self._stop_event = asyncio.Event()
+        # Create stop event in the loop's context
+        async def create_event():
+            self._stop_event = asyncio.Event()
 
-        # Start async streaming in background
-        asyncio.create_task(self._start_stream())
+        asyncio.run_coroutine_threadsafe(create_event(), self._loop).result()
+
+        # Start async streaming in background using the loop
+        asyncio.run_coroutine_threadsafe(self._start_stream(), self._loop)
 
     def close(self) -> None:
         """Close the audio source and release resources."""
