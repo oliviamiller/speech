@@ -5,7 +5,6 @@ Allows hearken to use Viam's AudioIn component as an audio source.
 """
 
 import asyncio
-import threading
 from typing import Optional
 from queue import Queue, Full, Empty
 from viam.components.audio_in import AudioIn
@@ -43,7 +42,6 @@ class ViamAudioInSource:
 
         self._audio_stream = None
         self._stop_event: Optional[asyncio.Event] = None
-        self._stream_ready = threading.Event()  # Signals when audio stream is consuming
         # Use a queue with limited size to prevent unbounded memory growth
         self._queue: Queue = Queue(maxsize=50)  # ~50 chunks buffer
 
@@ -54,8 +52,6 @@ class ViamAudioInSource:
         except RuntimeError:
             raise RuntimeError("ViamAudioInSource.open() requires a running event loop")
 
-        self._stream_ready.clear()
-
         # Schedule the async setup in the event loop
         async def setup():
             self._stop_event = asyncio.Event()
@@ -63,13 +59,8 @@ class ViamAudioInSource:
 
         asyncio.run_coroutine_threadsafe(setup(), loop)
 
-        # Block until the stream is ready and consuming
         if self.logger:
-            self.logger.debug("Waiting for audio stream to be ready...")
-        if not self._stream_ready.wait(timeout=5.0):
-            raise RuntimeError("Timeout waiting for audio stream to start")
-        if self.logger:
-            self.logger.debug("Audio stream ready, open() returning")
+            self.logger.debug("Audio stream setup scheduled")
 
     def close(self) -> None:
         """Close the audio source and release resources."""
@@ -146,9 +137,6 @@ class ViamAudioInSource:
             self._audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
             if self.logger:
                 self.logger.debug("Audio stream acquired, starting consumption loop")
-
-            # Signal that we're ready to consume
-            self._stream_ready.set()
 
             async for resp in self._audio_stream:
                 if self._stop_event and self._stop_event.is_set():
