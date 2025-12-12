@@ -884,6 +884,12 @@ class SpeechIOService(SpeechService, EasyResource):
 
         self.logger.debug(f"Using hearken listener with {vad_type} VAD and {source_name}")
 
+        # Configure hearken's logger to use the same level/handler as this service
+        import logging
+        hearken_logger = logging.getLogger("hearken")
+        hearken_logger.setLevel(self.logger.level)
+        hearken_logger.handlers = self.logger.handlers
+
         self.listener = Listener(
             source=source,
             vad=vad,

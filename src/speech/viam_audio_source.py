@@ -93,6 +93,8 @@ class ViamAudioInSource:
 
     def stream(self):
         """Return async iterator for streaming audio."""
+        if self.logger:
+            self.logger.info("ViamAudioInSource.stream() called - returning async iterator")
         return self._stream_audio_chunks()
 
     async def _stream_audio_chunks(self):
