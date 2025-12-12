@@ -62,25 +62,14 @@ class ViamAudioInSource:
         except RuntimeError:
             raise RuntimeError("ViamAudioInSource.open() requires a running event loop")
 
-        # Clear ready flag for new start
-        self._stream_ready.clear()
-
         # Schedule the async setup in the event loop
         async def setup():
             self._stop_event = asyncio.Event()
             self._stream_task = asyncio.create_task(self._stream_audio())
 
         if self.logger:
-            self.logger.debug("Scheduling audio stream setup...")
+            self.logger.debug("Scheduling audio stream setup (non-blocking)")
         asyncio.run_coroutine_threadsafe(setup(), loop)
-
-        # Block until the stream is ready and consuming
-        if self.logger:
-            self.logger.debug("Waiting for audio stream to be ready...")
-        if not self._stream_ready.wait(timeout=10.0):  # Increased timeout for resampling
-            raise RuntimeError("Timeout waiting for audio stream to start")
-        if self.logger:
-            self.logger.debug("Audio stream ready, open() returning")
 
     def close(self) -> None:
         """Close the audio source and release resources."""
