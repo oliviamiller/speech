@@ -44,39 +44,61 @@ class ViamAudioInSource:
         self._audio_stream = None
         self._stop_event: Optional[asyncio.Event] = None
         self._stream_ready = threading.Event()  # Signals when audio stream is consuming
+        self._stream_ready.clear()  # Start in non-ready state
+        self._stream_task: Optional[asyncio.Task] = None  # Track the stream task
         # Use a queue with limited size to prevent unbounded memory growth
         self._queue: Queue = Queue(maxsize=50)  # ~50 chunks buffer
 
     def open(self) -> None:
         """Open the audio source for reading."""
+        # Don't open if already running
+        if self._stream_task and not self._stream_task.done():
+            if self.logger:
+                self.logger.debug("Audio source already open, skipping")
+            return
+
         try:
             loop = asyncio.get_running_loop()
         except RuntimeError:
             raise RuntimeError("ViamAudioInSource.open() requires a running event loop")
 
+        # Clear ready flag for new start
         self._stream_ready.clear()
 
         # Schedule the async setup in the event loop
         async def setup():
             self._stop_event = asyncio.Event()
-            asyncio.create_task(self._stream_audio())
+            self._stream_task = asyncio.create_task(self._stream_audio())
 
+        if self.logger:
+            self.logger.debug("Scheduling audio stream setup...")
         asyncio.run_coroutine_threadsafe(setup(), loop)
 
         # Block until the stream is ready and consuming
         if self.logger:
             self.logger.debug("Waiting for audio stream to be ready...")
-        if not self._stream_ready.wait(timeout=5.0):
+        if not self._stream_ready.wait(timeout=10.0):  # Increased timeout for resampling
             raise RuntimeError("Timeout waiting for audio stream to start")
         if self.logger:
             self.logger.debug("Audio stream ready, open() returning")
 
     def close(self) -> None:
         """Close the audio source and release resources."""
+        if self.logger:
+            self.logger.debug("Closing audio source")
+
+        # Signal the task to stop
         if self._stop_event:
             self._stop_event.set()
-        # The audio stream is an async iterator that will clean up when the task ends
+
+        # Cancel the stream task
+        if self._stream_task and not self._stream_task.done():
+            self._stream_task.cancel()
+            if self.logger:
+                self.logger.debug("Cancelled audio stream task")
+
         self._audio_stream = None
+        self._stream_task = None
 
     def read(self, num_samples: int) -> bytes:
         """Read audio samples from the source.
@@ -147,6 +169,7 @@ class ViamAudioInSource:
             if self.logger:
                 self.logger.debug("Audio stream acquired, starting consumption loop")
 
+            self.logger.debug("setting stream ready")
             # Signal that we're ready to consume
             self._stream_ready.set()
 
