@@ -91,9 +91,71 @@ class ViamAudioInSource:
         self._audio_stream = None
         self._stream_task = None
 
+    def stream(self):
+        """Return async iterator for streaming audio."""
+        return self._stream_audio_chunks()
+
+    async def _stream_audio_chunks(self):
+        """Async generator that yields resampled audio chunks."""
+        try:
+            # Get actual properties from the microphone
+            properties = await self.microphone_client.get_properties()
+            source_sample_rate = properties.sample_rate_hz
+            if self.logger:
+                self.logger.debug(f"Stream: Microphone sample rate: {source_sample_rate}Hz")
+
+            # Target sample rate for VAD (WebRTC VAD requires 8/16/32 kHz)
+            target_sample_rate = 16000
+            needs_resampling = source_sample_rate != target_sample_rate
+
+            if needs_resampling:
+                if self.logger:
+                    self.logger.debug(f"Stream: Will resample from {source_sample_rate}Hz to {target_sample_rate}Hz")
+
+            # Expose target sample rate to hearken
+            self._sample_rate = target_sample_rate
+
+            # Get audio stream - this starts the capture
+            audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
+            if self.logger:
+                self.logger.debug("Stream: Audio stream acquired, starting to yield chunks")
+
+            # Get event loop for running blocking operations
+            loop = asyncio.get_event_loop()
+
+            async for resp in audio_stream:
+                audio_data = resp.audio.audio_data
+
+                # Resample in executor to avoid blocking event loop
+                if needs_resampling:
+                    def resample_chunk(data):
+                        segment = AudioSegment(
+                            data=data,
+                            sample_width=self._sample_width,
+                            frame_rate=source_sample_rate,
+                            channels=1
+                        )
+                        segment = segment.set_frame_rate(target_sample_rate)
+                        return segment.raw_data
+
+                    audio_data = await loop.run_in_executor(None, resample_chunk, audio_data)
+
+                # Yield the audio chunk
+                yield audio_data
+
+        except asyncio.CancelledError:
+            if self.logger:
+                self.logger.debug("Stream: Audio streaming cancelled")
+            raise
+        except Exception as e:
+            if self.logger:
+                self.logger.error(f"Stream: Error in audio streaming: {e}")
+            raise
+
     def read(self, num_samples: int) -> bytes:
-        time.sleep(1.0)
         """Read audio samples from the source.
+
+        Note: This is the legacy sync interface. Prefer using stream() for async sources.
 
         Args:
             num_samples: Number of samples to read
@@ -101,13 +163,6 @@ class ViamAudioInSource:
         Returns:
             Audio data as bytes
         """
-        # Rate limit to simulate real-time audio capture
-        # if self._last_read_time and self._sample_rate > 0:
-        #     expected_duration = num_samples / self._sample_rate
-        #     elapsed = time.time() - self._last_read_time
-        #     if elapsed < expected_duration:
-        #         time.sleep(expected_duration - elapsed)
-
         self._last_read_time = time.time()
 
         chunk_size = num_samples * self._sample_width
