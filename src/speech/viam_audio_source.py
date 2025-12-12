@@ -5,9 +5,11 @@ Allows hearken to use Viam's AudioIn component as an audio source.
 """
 
 import asyncio
+import threading
 from typing import Optional
 from queue import Queue, Full, Empty
 from viam.components.audio_in import AudioIn
+from pydub import AudioSegment
 
 
 class ViamAudioInSource:
@@ -41,19 +43,33 @@ class ViamAudioInSource:
 
         self._audio_stream = None
         self._stop_event: Optional[asyncio.Event] = None
+        self._stream_ready = threading.Event()  # Signals when audio stream is consuming
         # Use a queue with limited size to prevent unbounded memory growth
         self._queue: Queue = Queue(maxsize=50)  # ~50 chunks buffer
 
     def open(self) -> None:
         """Open the audio source for reading."""
         try:
-            asyncio.get_running_loop()
+            loop = asyncio.get_running_loop()
         except RuntimeError:
             raise RuntimeError("ViamAudioInSource.open() requires a running event loop")
 
-        self._stop_event = asyncio.Event()
-        # Start async streaming in background
-        asyncio.create_task(self._start_stream())
+        self._stream_ready.clear()
+
+        # Schedule the async setup in the event loop
+        async def setup():
+            self._stop_event = asyncio.Event()
+            asyncio.create_task(self._stream_audio())
+
+        asyncio.run_coroutine_threadsafe(setup(), loop)
+
+        # Block until the stream is ready and consuming
+        if self.logger:
+            self.logger.debug("Waiting for audio stream to be ready...")
+        if not self._stream_ready.wait(timeout=5.0):
+            raise RuntimeError("Timeout waiting for audio stream to start")
+        if self.logger:
+            self.logger.debug("Audio stream ready, open() returning")
 
     def close(self) -> None:
         """Close the audio source and release resources."""
@@ -61,24 +77,6 @@ class ViamAudioInSource:
             self._stop_event.set()
         # The audio stream is an async iterator that will clean up when the task ends
         self._audio_stream = None
-
-    async def _start_stream(self):
-        """Internal method to start streaming audio from Viam component."""
-        try:
-            if self.logger:
-                self.logger.debug("Starting Viam audio stream...")
-
-            # Get actual properties from the microphone
-            properties = await self.microphone_client.get_properties()
-            self._sample_rate = properties.sample_rate_hz
-
-            # Start the streaming task - it will call get_audio() when ready
-            asyncio.create_task(self._stream_audio())
-            if self.logger:
-                self.logger.debug("Viam audio stream task created")
-        except Exception as e:
-            if self.logger:
-                self.logger.error(f"Failed to start Viam audio stream: {e}")
 
     def read(self, num_samples: int) -> bytes:
         """Read audio samples from the source.
@@ -127,10 +125,30 @@ class ViamAudioInSource:
             self.logger.debug("_stream_audio task started")
         chunk_count = 0
         try:
+            # Get actual properties from the microphone
+            properties = await self.microphone_client.get_properties()
+            source_sample_rate = properties.sample_rate_hz
+            if self.logger:
+                self.logger.debug(f"Microphone sample rate: {source_sample_rate}Hz")
+
+            # Target sample rate for VAD (WebRTC VAD requires 8/16/32 kHz)
+            target_sample_rate = 16000
+            needs_resampling = source_sample_rate != target_sample_rate
+
+            if needs_resampling:
+                if self.logger:
+                    self.logger.debug(f"Will resample from {source_sample_rate}Hz to {target_sample_rate}Hz")
+
+            # Expose target sample rate to hearken
+            self._sample_rate = target_sample_rate
+
             # Get audio stream - this starts the capture
             self._audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
             if self.logger:
                 self.logger.debug("Audio stream acquired, starting consumption loop")
+
+            # Signal that we're ready to consume
+            self._stream_ready.set()
 
             async for resp in self._audio_stream:
                 if self._stop_event and self._stop_event.is_set():
@@ -138,6 +156,17 @@ class ViamAudioInSource:
 
                 audio_data = resp.audio.audio_data
                 chunk_count += 1
+
+                # Resample if needed
+                if needs_resampling:
+                    audio_segment = AudioSegment(
+                        data=audio_data,
+                        sample_width=self._sample_width,
+                        frame_rate=source_sample_rate,
+                        channels=1
+                    )
+                    audio_segment = audio_segment.set_frame_rate(target_sample_rate)
+                    audio_data = audio_segment.raw_data
 
                 # Put audio in queue with backpressure (non-blocking)
                 try:
