@@ -92,6 +92,7 @@ class ViamAudioInSource:
         self._stream_task = None
 
     def read(self, num_samples: int) -> bytes:
+        time.sleep(1.0)
         """Read audio samples from the source.
 
         Args:
@@ -101,11 +102,11 @@ class ViamAudioInSource:
             Audio data as bytes
         """
         # Rate limit to simulate real-time audio capture
-        if self._last_read_time and self._sample_rate > 0:
-            expected_duration = num_samples / self._sample_rate
-            elapsed = time.time() - self._last_read_time
-            if elapsed < expected_duration:
-                time.sleep(expected_duration - elapsed)
+        # if self._last_read_time and self._sample_rate > 0:
+        #     expected_duration = num_samples / self._sample_rate
+        #     elapsed = time.time() - self._last_read_time
+        #     if elapsed < expected_duration:
+        #         time.sleep(expected_duration - elapsed)
 
         self._last_read_time = time.time()
 
