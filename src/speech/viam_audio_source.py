@@ -6,6 +6,7 @@ Allows hearken to use Viam's AudioIn component as an audio source.
 
 import asyncio
 import threading
+import time
 from typing import Optional
 from queue import Queue, Full, Empty
 from viam.components.audio_in import AudioIn
@@ -46,6 +47,7 @@ class ViamAudioInSource:
         self._stream_ready = threading.Event()  # Signals when audio stream is consuming
         self._stream_ready.clear()  # Start in non-ready state
         self._stream_task: Optional[asyncio.Task] = None  # Track the stream task
+        self._last_read_time: Optional[float] = None  # For rate limiting
         # Use a queue with limited size to prevent unbounded memory growth
         self._queue: Queue = Queue(maxsize=50)  # ~50 chunks buffer
 
@@ -98,6 +100,15 @@ class ViamAudioInSource:
         Returns:
             Audio data as bytes
         """
+        # Rate limit to simulate real-time audio capture
+        if self._last_read_time and self._sample_rate > 0:
+            expected_duration = num_samples / self._sample_rate
+            elapsed = time.time() - self._last_read_time
+            if elapsed < expected_duration:
+                time.sleep(expected_duration - elapsed)
+
+        self._last_read_time = time.time()
+
         chunk_size = num_samples * self._sample_width
         buffer = bytearray()
 
@@ -162,6 +173,9 @@ class ViamAudioInSource:
             # Signal that we're ready to consume
             self._stream_ready.set()
 
+            # Get event loop for running blocking operations
+            loop = asyncio.get_event_loop()
+
             async for resp in self._audio_stream:
                 if self._stop_event and self._stop_event.is_set():
                     break
@@ -169,16 +183,19 @@ class ViamAudioInSource:
                 audio_data = resp.audio.audio_data
                 chunk_count += 1
 
-                # Resample if needed
+                # Resample in executor to avoid blocking event loop
                 if needs_resampling:
-                    audio_segment = AudioSegment(
-                        data=audio_data,
-                        sample_width=self._sample_width,
-                        frame_rate=source_sample_rate,
-                        channels=1
-                    )
-                    audio_segment = audio_segment.set_frame_rate(target_sample_rate)
-                    audio_data = audio_segment.raw_data
+                    def resample_chunk(data):
+                        segment = AudioSegment(
+                            data=data,
+                            sample_width=self._sample_width,
+                            frame_rate=source_sample_rate,
+                            channels=1
+                        )
+                        segment = segment.set_frame_rate(target_sample_rate)
+                        return segment.raw_data
+
+                    audio_data = await loop.run_in_executor(None, resample_chunk, audio_data)
 
                 # Put audio in queue with backpressure (non-blocking)
                 try:
