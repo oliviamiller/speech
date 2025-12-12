@@ -72,11 +72,10 @@ class ViamAudioInSource:
             properties = await self.microphone_client.get_properties()
             self._sample_rate = properties.sample_rate_hz
 
-            self._audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
-            # Start the streaming task
+            # Start the streaming task - it will call get_audio() when ready
             asyncio.create_task(self._stream_audio())
             if self.logger:
-                self.logger.debug("Viam audio stream started")
+                self.logger.debug("Viam audio stream task created")
         except Exception as e:
             if self.logger:
                 self.logger.error(f"Failed to start Viam audio stream: {e}")
@@ -124,8 +123,15 @@ class ViamAudioInSource:
 
     async def _stream_audio(self):
         """Continuously stream audio from Viam into the queue."""
+        if self.logger:
+            self.logger.debug("_stream_audio task started")
         chunk_count = 0
         try:
+            # Get audio stream - this starts the capture
+            self._audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
+            if self.logger:
+                self.logger.debug("Audio stream acquired, starting consumption loop")
+
             async for resp in self._audio_stream:
                 if self._stop_event and self._stop_event.is_set():
                     break

@@ -87,6 +87,7 @@ class VoskHandler:
             self.logger.error(f"Failed to start Vosk VAD: {e}")
             return False
 
+
     def stop(self):
         """Stop Vosk VAD"""
         if self.state.closer is not None:
