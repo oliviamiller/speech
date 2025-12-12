@@ -11,7 +11,7 @@ from viam.components.audio_in import AudioIn
 
 
 class ViamAudioInSource:
-    """Adapter to use Viam AudioIn component with hearken Listener.
+    """Interface to use Viam AudioIn component with hearken Listener.
 
     This adapter bridges Viam's async AudioIn streaming API with hearken's
     synchronous audio source interface.

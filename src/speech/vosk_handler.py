@@ -98,7 +98,7 @@ class VoskHandler:
             try:
                 self.state.stream.close()
             except:
-                pass
+                self.logger.error("failed to close VOSK VAD stream")
 
     def _listen_in_background_async(self):
         """Unified Vosk VAD for both Viam and PyAudio"""
@@ -109,9 +109,7 @@ class VoskHandler:
             phrase_start_time = None
 
             try:
-                # Get audio stream (different for Viam vs PyAudio)
                 if self.microphone_client is not None:
-                    # Viam: async stream
                     audio_stream = await self.microphone_client.get_audio("pcm16", 0, 0)
                     async for resp in audio_stream:
                         if self.state.async_stop_event.is_set():
@@ -134,7 +132,7 @@ class VoskHandler:
                         phrase_start_time = self._process_audio(audio_data, phrase_start_time)
 
                 else:
-                    # PyAudio: sync stream wrapped in async
+                    # use legacy pyaudio microphone
                     p = pyaudio.PyAudio()
                     stream = p.open(
                         format=pyaudio.paInt16,
@@ -173,7 +171,7 @@ class VoskHandler:
         return stopper
 
     def _process_audio(self, audio_data: bytes, phrase_start_time: Optional[float]) -> Optional[float]:
-        """Process audio chunk through Vosk - unified for both sources"""
+        """Process audio chunk through Vosk """
         try:
             if self.state.rec.AcceptWaveform(audio_data):
                 result = json.loads(self.state.rec.Result())

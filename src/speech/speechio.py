@@ -36,7 +36,7 @@ from elevenlabs import save as eleven_save
 from gtts import gTTS
 import openai
 import speech_recognition as sr
-from pydub import AudioSegment, silence
+from pydub import AudioSegment
 from google.cloud.speech import (
     RecognizeResponse,
 )
@@ -216,14 +216,20 @@ class SpeechIOService(SpeechService, EasyResource):
 
                         if blocking:
                             # Wait for playback to complete
-                            await self.speaker_client.play(audio_data, audio_info)
-                            self.logger.debug("playback complete")
-                            self.is_playing_audio = False
+                            try:
+                                await self.speaker_client.play(audio_data, audio_info)
+                            except Exception as e:
+                                self.logger.error(f"Error playing audio: {e}")
+                            finally:
+                                self.logger.debug("playback complete")
+                                self.is_playing_audio = False
                         else:
                             # Start playback and return immediately
                             async def play_and_cleanup():
                                 try:
                                     await self.speaker_client.play(audio_data, audio_info)
+                                except Exception as e:
+                                    self.logger.error(f"Error playing audio: {e}")
                                 finally:
                                     self.is_playing_audio = False
 
@@ -283,7 +289,7 @@ class SpeechIOService(SpeechService, EasyResource):
                 self.listen_closer = rec_state.rec.listen_in_background(
                     source=rec_state.mic,
                     phrase_time_limit=self.listen_phrase_time_limit,
-                    callback=self.listen_callback,
+                    callback=lambda recognizer, audio: self.listen_callback(audio),
                 )
         else:
             raise ValueError("Invalid trigger type provided")
@@ -405,12 +411,10 @@ class SpeechIOService(SpeechService, EasyResource):
             # Run wait_for_speech in executor to avoid blocking event loop
             self.logger.debug("Waiting for speech detection")
             loop = asyncio.get_event_loop()
-            # Add a 30 second timeout
             segment = await loop.run_in_executor(
                 None,
                 lambda: self.listener.wait_for_speech()
             )
-            self.logger.debug(f"wait_for_speech returned: {segment}")
 
             # Clean up temporary listener
             if temp_listener and listener_closer:
@@ -426,8 +430,7 @@ class SpeechIOService(SpeechService, EasyResource):
         #Use legacy SR microphone
         elif rec_state.rec is not None and rec_state.mic is not None:
             if self.use_new_listener:
-                segment = self.listener.wait_for_speech()
-                if segment:
+                if segment := self.listener.wait_for_speech():
                     audio = sr.AudioData(
                         segment.audio_data, segment.sample_rate, segment.sample_width
                     )
@@ -436,6 +439,7 @@ class SpeechIOService(SpeechService, EasyResource):
             else:
                 with rec_state.mic as source:
                     audio = rec_state.rec.listen(source)
+
             return await self.convert_audio_to_text(audio)
 
 
@@ -590,50 +594,6 @@ class SpeechIOService(SpeechService, EasyResource):
         except Exception as e:
             self.logger.error(f"Failed to start Vosk VAD: {e}")
             return False
-
-    def download_vosk_model(self):
-        """Download Vosk model automatically"""
-        try:
-            import urllib.request
-            import zipfile
-
-            model_name = "vosk-model-small-en-us-0.15"
-            model_url = (
-                "https://alphacephei.com/vosk/models/vosk-model-small-en-us-0.15.zip"
-            )
-            model_path = os.path.expanduser(f"~/{model_name}")
-            zip_path = os.path.expanduser(f"~/{model_name}.zip")
-
-            self.logger.debug(f"Downloading Vosk model from {model_url}")
-
-            # Download the model
-            urllib.request.urlretrieve(model_url, zip_path)
-
-            # Extract the model
-            self.logger.debug("Extracting Vosk model...")
-            with zipfile.ZipFile(zip_path, "r") as zip_ref:
-                zip_ref.extractall(os.path.expanduser("~/"))
-
-            # Clean up zip file
-            os.remove(zip_path)
-
-            # Verify the model was extracted correctly
-            if os.path.exists(model_path):
-                self.logger.debug(f"Vosk model downloaded successfully to {model_path}")
-                return True
-            else:
-                self.logger.error("Failed to extract Vosk model")
-                return False
-
-        except Exception as e:
-            self.logger.error(f"Failed to download Vosk model: {e}")
-            return False
-
-    def stop_vosk_vad(self):
-        """Stop Vosk VAD using VoskHandler"""
-        if self.vosk_handler:
-            self.vosk_handler.stop()
-            self.vosk_handler = None
 
     def listen_callback(self, audio):
         """Process audio with optional fuzzy trigger matching."""
@@ -958,7 +918,7 @@ class SpeechIOService(SpeechService, EasyResource):
         # Try Vosk VAD first if enabled (works with both modern and legacy microphones)
         if self.use_vosk_vad and self.start_vosk_vad():
             self.logger.debug("Using Vosk VAD for voice activity detection")
-            return  # Vosk VAD handles everything
+            return  # Vosk VAD handles everything (VAD + STT)
 
         # Vosk not enabled/available, set up appropriate fallback VAD
         if self.microphone_client is not None and not self.disable_mic:
@@ -1002,7 +962,7 @@ class SpeechIOService(SpeechService, EasyResource):
                 self.listen_closer = rec_state.rec.listen_in_background(
                     source=rec_state.mic,
                     phrase_time_limit=self.listen_phrase_time_limit,
-                    callback=self.listen_callback,
+                    callback=lambda recognizer, audio: self.listen_callback(audio),
                 )
 
     def reconfigure(
