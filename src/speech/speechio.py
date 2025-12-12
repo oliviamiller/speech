@@ -595,6 +595,12 @@ class SpeechIOService(SpeechService, EasyResource):
             self.logger.error(f"Failed to start Vosk VAD: {e}")
             return False
 
+    def stop_vosk_vad(self):
+        """Stop Vosk VAD if running"""
+        if self.vosk_handler is not None:
+            self.vosk_handler.stop()
+            self.vosk_handler = None
+
     def listen_callback(self, audio):
         """Process audio with optional fuzzy trigger matching."""
         if not self.main_loop or not self.main_loop.is_running():
