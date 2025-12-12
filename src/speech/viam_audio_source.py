@@ -6,7 +6,7 @@ Allows hearken to use Viam's AudioIn component as an audio source.
 
 import asyncio
 from typing import Optional
-from queue import Queue, Full
+from queue import Queue, Full, Empty
 from viam.components.audio_in import AudioIn
 
 
@@ -133,9 +133,9 @@ class ViamAudioInSource:
                 audio_data = resp.audio.audio_data
                 chunk_count += 1
 
-                # Put audio in queue with backpressure
+                # Put audio in queue with backpressure (non-blocking)
                 try:
-                    self._queue.put(audio_data, timeout=0.01)
+                    self._queue.put_nowait(audio_data)
                 except Full:
                     # Queue full - drop this chunk (backpressure)
                     if self.logger:
