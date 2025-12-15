@@ -884,12 +884,6 @@ class SpeechIOService(SpeechService, EasyResource):
 
         self.logger.debug(f"Using hearken listener with {vad_type} VAD and {source_name}")
 
-        # Configure hearken's logger to use the same level/handler as this service
-        import logging
-        hearken_logger = logging.getLogger("hearken")
-        hearken_logger.setLevel(self.logger.level)
-        hearken_logger.handlers = self.logger.handlers
-
         self.listener = Listener(
             source=source,
             vad=vad,
@@ -901,6 +895,7 @@ class SpeechIOService(SpeechService, EasyResource):
                     segment.sample_width,
                 )
             ),
+            event_loop=self.main_loop,  # Pass event loop for async sources
         )
 
         def listener_closer(wait_for_stop=True):
@@ -985,6 +980,13 @@ class SpeechIOService(SpeechService, EasyResource):
         except RuntimeError:
             self.main_loop = None
             self.logger.error("Could not get running event loop in reconfigure.")
+
+        # Configure hearken logger to reduce noise from DEBUG logs
+        import logging
+        hearken_logger = logging.getLogger("hearken")
+        hearken_logger.setLevel(logging.INFO)
+        if self.logger.handlers:
+            hearken_logger.handlers = self.logger.handlers
 
         attrs = struct_to_dict(config.attributes)
         self.speech_provider = SpeechProvider[

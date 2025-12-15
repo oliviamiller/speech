@@ -38,8 +38,8 @@ source $VIRTUAL_ENV/bin/activate
 echo "Virtualenv found/created. Installing/upgrading Python packages..."
 uv pip install --prerelease=allow -r requirements.txt -q
 
-# Install local hearken in editable mode
+# Install local hearken in editable mode with extras
 if [ -d "/home/viam/hearken" ]; then
   echo "Installing local hearken..."
-  uv pip install -e /home/viam/hearken
+  uv pip install -e /home/viam/hearken[webrtc,silero,sr]
 fi
