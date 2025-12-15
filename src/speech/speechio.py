@@ -167,9 +167,11 @@ class SpeechIOService(SpeechService, EasyResource):
         if str == "":
             raise ValueError("No text provided")
 
+        self.logger.info(f"say() called with text='{text[:50]}...', provider={self.speech_provider}")
         self.logger.debug("Generating audio...")
         if not os.path.isdir(CACHEDIR):
             os.mkdir(CACHEDIR)
+            self.logger.debug(f"Created cache directory: {CACHEDIR}")
 
         file = os.path.join(
             CACHEDIR,
@@ -181,11 +183,15 @@ class SpeechIOService(SpeechService, EasyResource):
         )
         try:
             if not os.path.isfile(file):   # read from cache if it exists
+                self.logger.info(f"Cache miss, generating TTS for: {file}")
                 if self.speech_provider == "elevenlabs":
+                    self.logger.debug("Calling ElevenLabs API...")
                     audio = self.eleven_client["client"].text_to_speech.convert(
                         text=text, **self.speech_generation_config
                     )
+                    self.logger.debug("ElevenLabs API responded, saving...")
                     eleven_save(audio=audio, filename=file)
+                    self.logger.debug("Saved to file")
                     # Create audio_bytes for speaker_client path
                     audio_bytes = BytesIO()
                     if isinstance(audio, Iterator):
@@ -194,10 +200,35 @@ class SpeechIOService(SpeechService, EasyResource):
                     else:
                         audio_bytes.write(audio)
                 else:
-                    sp = gTTS(text=text, **self.speech_generation_config)
-                    sp.save(file)
-                    audio_bytes = BytesIO()
-                    sp.write_to_fp(audio_bytes)
+                    self.logger.debug("Calling gTTS API...")
+                    # Run blocking gTTS operations in executor
+                    loop = asyncio.get_event_loop()
+
+                    def generate_tts():
+                        sp = gTTS(text=text, **self.speech_generation_config)
+                        self.logger.debug("gTTS initialized, saving to file...")
+                        sp.save(file)
+                        self.logger.debug("gTTS saved to file")
+                        audio_fp = BytesIO()
+                        sp.write_to_fp(audio_fp)
+                        return audio_fp.getvalue()
+
+                    try:
+                        self.logger.debug("Running gTTS in executor with timeout...")
+                        audio_bytes_data = await asyncio.wait_for(
+                            loop.run_in_executor(None, generate_tts),
+                            timeout=15.0  # 15 second timeout
+                        )
+                        audio_bytes = BytesIO(audio_bytes_data)
+                        self.logger.debug("gTTS audio ready")
+                    except asyncio.TimeoutError:
+                        self.logger.error("gTTS timed out after 15 seconds!")
+                        raise
+                    except Exception as e:
+                        self.logger.error(f"gTTS error: {e}")
+                        raise
+            else:
+                self.logger.info(f"Cache hit: {file}")
 
             if self.speaker_client is not None:
                 if not cache_only:
@@ -396,7 +427,7 @@ class SpeechIOService(SpeechService, EasyResource):
             temp_listener = False
             listener_closer = None
             if not self.listener:
-                temp_listener = True  # Mark this as temporary
+                temp_listener = True
                 self.logger.debug("creating hearken listener for one-off listen()")
                 viam_source = ViamAudioInSource(
                     microphone_client=self.microphone_client,
